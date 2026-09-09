@@ -96,6 +96,46 @@ describe("api period digest route", () => {
 		);
 	});
 
+	it("honors the liveSyncMode query param", async () => {
+		const response = await GET({
+			request: new Request(
+				"http://localhost/api/period-digest?liveSyncMode=bird",
+			),
+		});
+
+		expect(response.headers.get("content-type")).toContain(
+			"application/x-ndjson",
+		);
+		expect(streamPeriodDigestMock).toHaveBeenCalledWith(
+			expect.objectContaining({ liveSyncMode: "bird" }),
+			expect.objectContaining({ onEvent: expect.any(Function) }),
+		);
+	});
+
+	it("defaults liveSyncMode from BIRDCLAW_DIGEST_LIVE_MODE", async () => {
+		const previous = process.env.BIRDCLAW_DIGEST_LIVE_MODE;
+		process.env.BIRDCLAW_DIGEST_LIVE_MODE = "bird";
+		try {
+			const response = await GET({
+				request: new Request("http://localhost/api/period-digest"),
+			});
+
+			expect(response.headers.get("content-type")).toContain(
+				"application/x-ndjson",
+			);
+			expect(streamPeriodDigestMock).toHaveBeenCalledWith(
+				expect.objectContaining({ liveSyncMode: "bird" }),
+				expect.objectContaining({ onEvent: expect.any(Function) }),
+			);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.BIRDCLAW_DIGEST_LIVE_MODE;
+			} else {
+				process.env.BIRDCLAW_DIGEST_LIVE_MODE = previous;
+			}
+		}
+	});
+
 	it("rejects invalid language tags before starting a digest", async () => {
 		const response = await GET({
 			request: new Request(

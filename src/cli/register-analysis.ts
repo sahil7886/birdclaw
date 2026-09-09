@@ -1,5 +1,6 @@
 import type { CliCommandContext } from "./command-context";
 import {
+	defaultDigestLiveSyncMode,
 	normalizeDigestLanguage,
 	streamPeriodDigest,
 	type PeriodDigestOptions,
@@ -30,7 +31,7 @@ export function registerAnalysisCommands({
 	function parseDigestLiveModeOption(
 		value: string | undefined,
 	): PeriodDigestOptions["liveSyncMode"] {
-		const normalized = (value ?? "xurl").trim().toLowerCase();
+		const normalized = (value ?? defaultDigestLiveSyncMode()).trim().toLowerCase();
 		if (
 			normalized === "auto" ||
 			normalized === "bird" ||
@@ -460,8 +461,8 @@ export function registerAnalysisCommands({
 		.option("--no-live-sync", "Use only the local database")
 		.option(
 			"--live-mode <mode>",
-			"Live timeline mode: xurl, bird, or auto",
-			"xurl",
+			"Live timeline mode: xurl, bird, or auto (env: BIRDCLAW_DIGEST_LIVE_MODE)",
+			defaultDigestLiveSyncMode(),
 		)
 		.action(async (options) => {
 			await autoUpdateBeforeRead();
@@ -488,8 +489,8 @@ export function registerAnalysisCommands({
 		.option("--no-live-sync", "Use only the local database")
 		.option(
 			"--live-mode <mode>",
-			"Live timeline mode: xurl, bird, or auto",
-			"xurl",
+			"Live timeline mode: xurl, bird, or auto (env: BIRDCLAW_DIGEST_LIVE_MODE)",
+			defaultDigestLiveSyncMode(),
 		)
 		.action(async (period, options) => {
 			await autoUpdateBeforeRead();

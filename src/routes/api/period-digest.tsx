@@ -11,6 +11,7 @@ import {
 import { createEffectNdjsonResponse } from "#/lib/ndjson-stream";
 import {
 	normalizeDigestLanguage,
+	parseDigestLiveSyncMode,
 	streamPeriodDigestEffect,
 	type PeriodDigestOptions,
 	type PeriodDigestStreamEvent,
@@ -39,7 +40,9 @@ function parseOptions(url: URL): PeriodDigestOptions {
 			max: 25,
 		}),
 		liveSync: url.searchParams.get("liveSync") !== "false",
-		liveSyncMode: "xurl",
+		liveSyncMode: parseDigestLiveSyncMode(
+			url.searchParams.get("liveSyncMode"),
+		),
 		liveTimelineLimit: parseBoundedInteger(
 			url.searchParams.get("liveTimelineLimit"),
 			{ max: 100_000 },
