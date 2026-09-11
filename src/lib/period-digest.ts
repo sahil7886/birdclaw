@@ -723,7 +723,7 @@ function refreshPeriodDigestInputsEffect(
 				emitDigestStatus(
 					handlers,
 					"Fetching home timeline from X",
-					"Walking the selected time window with xurl.",
+					`Walking the selected time window with ${mode}.`,
 				),
 			);
 			const result = yield* syncHomeTimelineEffect({

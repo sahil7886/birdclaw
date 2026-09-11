@@ -9,9 +9,9 @@ import {
 	sensitiveRequestErrorResponse,
 } from "#/lib/http-effect";
 import { createEffectNdjsonResponse } from "#/lib/ndjson-stream";
+import { parseDigestLiveSyncMode } from "#/lib/digest-live-mode";
 import {
 	normalizeDigestLanguage,
-	parseDigestLiveSyncMode,
 	streamPeriodDigestEffect,
 	type PeriodDigestOptions,
 	type PeriodDigestStreamEvent,
@@ -40,9 +40,7 @@ function parseOptions(url: URL): PeriodDigestOptions {
 			max: 25,
 		}),
 		liveSync: url.searchParams.get("liveSync") !== "false",
-		liveSyncMode: parseDigestLiveSyncMode(
-			url.searchParams.get("liveSyncMode"),
-		),
+		liveSyncMode: parseDigestLiveSyncMode(url.searchParams.get("liveSyncMode")),
 		liveTimelineLimit: parseBoundedInteger(
 			url.searchParams.get("liveTimelineLimit"),
 			{ max: 100_000 },

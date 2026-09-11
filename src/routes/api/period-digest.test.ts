@@ -96,20 +96,26 @@ describe("api period digest route", () => {
 		);
 	});
 
-	it("honors the liveSyncMode query param", async () => {
-		const response = await GET({
-			request: new Request(
-				"http://localhost/api/period-digest?liveSyncMode=bird",
-			),
-		});
+	it("prefers the liveSyncMode query param over the environment", async () => {
+		vi.stubEnv("BIRDCLAW_DIGEST_LIVE_MODE", "xurl");
+		try {
+			const response = await GET({
+				request: new Request(
+					"http://localhost/api/period-digest?liveSyncMode=bird",
+				),
+			});
 
-		expect(response.headers.get("content-type")).toContain(
-			"application/x-ndjson",
-		);
-		expect(streamPeriodDigestMock).toHaveBeenCalledWith(
-			expect.objectContaining({ liveSyncMode: "bird" }),
-			expect.objectContaining({ onEvent: expect.any(Function) }),
-		);
+			expect(response.headers.get("content-type")).toContain(
+				"application/x-ndjson",
+			);
+			expect(await response.text()).toContain('"type":"done"');
+			expect(streamPeriodDigestMock).toHaveBeenCalledWith(
+				expect.objectContaining({ liveSyncMode: "bird" }),
+				expect.objectContaining({ onEvent: expect.any(Function) }),
+			);
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 
 	it("defaults liveSyncMode from BIRDCLAW_DIGEST_LIVE_MODE", async () => {
@@ -123,6 +129,7 @@ describe("api period digest route", () => {
 			expect(response.headers.get("content-type")).toContain(
 				"application/x-ndjson",
 			);
+			expect(await response.text()).toContain('"type":"done"');
 			expect(streamPeriodDigestMock).toHaveBeenCalledWith(
 				expect.objectContaining({ liveSyncMode: "bird" }),
 				expect.objectContaining({ onEvent: expect.any(Function) }),

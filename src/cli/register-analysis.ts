@@ -1,6 +1,6 @@
 import type { CliCommandContext } from "./command-context";
+import { defaultDigestLiveSyncMode } from "#/lib/digest-live-mode";
 import {
-	defaultDigestLiveSyncMode,
 	normalizeDigestLanguage,
 	streamPeriodDigest,
 	type PeriodDigestOptions,
@@ -31,7 +31,9 @@ export function registerAnalysisCommands({
 	function parseDigestLiveModeOption(
 		value: string | undefined,
 	): PeriodDigestOptions["liveSyncMode"] {
-		const normalized = (value ?? defaultDigestLiveSyncMode()).trim().toLowerCase();
+		const normalized = (value ?? defaultDigestLiveSyncMode())
+			.trim()
+			.toLowerCase();
 		if (
 			normalized === "auto" ||
 			normalized === "bird" ||

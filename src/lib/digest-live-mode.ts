@@ -17,11 +17,7 @@ export function parseDigestLiveSyncMode(
 		return defaultDigestLiveSyncMode();
 	}
 	const normalized = value.trim().toLowerCase();
-	if (
-		normalized === "auto" ||
-		normalized === "bird" ||
-		normalized === "xurl"
-	) {
+	if (normalized === "auto" || normalized === "bird" || normalized === "xurl") {
 		return normalized;
 	}
 	return defaultDigestLiveSyncMode();
