@@ -112,7 +112,7 @@ export const feedActionIconWrapClass =
 export const feedActionIconClass = "size-[18px]";
 
 export const feedRowTextClass =
-	"whitespace-pre-wrap break-words text-[15px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere]";
+	"whitespace-pre-wrap break-words text-[15px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere] [-webkit-touch-callout:none] [&_a]:[-webkit-touch-callout:none] [&_a]:[touch-action:manipulation]";
 
 export const feedRowStatePillClass =
 	"inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg-active)] px-2 py-0.5 text-[12px] font-semibold text-[var(--ink-soft)]";

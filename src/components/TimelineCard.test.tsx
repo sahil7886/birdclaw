@@ -201,7 +201,13 @@ describe("TimelineCard", () => {
 
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
-		fireEvent.click(row);
+		// Row tap is dismiss-only now: plain-text taps never open a thread, so
+		// opening is verified via the explicit Thread button instead.
+		fireEvent.click(
+			within(row as HTMLElement).getByRole("button", {
+				name: "Show conversation",
+			}),
+		);
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_original",
 		);
@@ -252,7 +258,12 @@ describe("TimelineCard", () => {
 
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
-		fireEvent.click(row);
+		// Dismiss-only row tap: open via the explicit Thread button.
+		fireEvent.click(
+			within(row as HTMLElement).getByRole("button", {
+				name: "Show conversation",
+			}),
+		);
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_manual",
 		);
@@ -320,7 +331,12 @@ describe("TimelineCard", () => {
 		const second = rows[1];
 		if (!first || !second) throw new Error("timeline cards missing");
 
-		fireEvent.click(first);
+		// Dismiss-only row tap: open the first row via its Thread button.
+		fireEvent.click(
+			within(first as HTMLElement).getByRole("button", {
+				name: "Show conversation",
+			}),
+		);
 
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_original",
@@ -950,7 +966,7 @@ describe("TimelineCard", () => {
 		expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 	});
 
-	it("expands the archived conversation when the tweet row is clicked", async () => {
+	it("dismisses any open conversation when the tweet row is tapped", async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
 			json: async () => ({
@@ -985,15 +1001,22 @@ describe("TimelineCard", () => {
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
 
+		// Open via the explicit Thread button, then verify a plain-text row tap
+		// only dismisses (and never re-opens or fetches again).
+		fireEvent.click(
+			within(row as HTMLElement).getByRole("button", {
+				name: "Show conversation",
+			}),
+		);
+		expect(await screen.findByText("Parent in thread")).toBeInTheDocument();
+
 		fireEvent.click(row);
 
-		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_1");
-		expect(await screen.findByText("Parent in thread")).toBeInTheDocument();
-		expect(screen.getByText("2 tweets in conversation")).toBeInTheDocument();
-		expect(screen.getByText("selected")).toBeInTheDocument();
+		expect(screen.queryByText("Parent in thread")).not.toBeInTheDocument();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("prefetches conversation context on hover and keeps one thread open", async () => {
+	it("dismisses a thread opened from another row via plain-text tap", async () => {
 		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
 			const tweetId = new URL(
 				String(input),
@@ -1039,20 +1062,33 @@ describe("TimelineCard", () => {
 		const second = rows[1];
 		if (!first || !second) throw new Error("timeline cards missing");
 
+		// Open tweet_a's thread from its explicit Thread button.
 		fireEvent.mouseEnter(first);
 		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_a");
-
-		fireEvent.click(first);
+		fireEvent.click(
+			within(first as HTMLElement).getByRole("button", {
+				name: "Show conversation",
+			}),
+		);
 		expect(
 			await screen.findByText("Conversation for tweet_a"),
 		).toBeInTheDocument();
 
+		// Plain-text tap on the OTHER row dismisses the open thread...
 		fireEvent.click(second);
-		expect(
-			await screen.findByText("Conversation for tweet_b"),
-		).toBeInTheDocument();
 		expect(
 			screen.queryByText("Conversation for tweet_a"),
 		).not.toBeInTheDocument();
+		// ...and does not open tweet_b's thread or fetch its conversation.
+		expect(fetchMock).not.toHaveBeenCalledWith(
+			"/api/conversation?tweetId=tweet_b",
+		);
+
+		// Tapping the row that owns the (now closed) thread stays closed too.
+		fireEvent.click(first);
+		expect(
+			screen.queryByText("Conversation for tweet_a"),
+		).not.toBeInTheDocument();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });

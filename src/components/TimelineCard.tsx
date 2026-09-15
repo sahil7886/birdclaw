@@ -333,14 +333,22 @@ export function TimelineCard({
 		<article
 			className={cx(
 				feedRowClass,
-				"cursor-pointer [content-visibility:auto] [contain-intrinsic-size:auto_280px]",
+				"cursor-default [content-visibility:auto] [contain-intrinsic-size:auto_280px]",
 			)}
 			data-perf="timeline-card"
 			onFocus={conversation.prefetch}
 			onMouseEnter={conversation.prefetch}
 			onClick={(event) => {
+				// Plain-text taps only ever dismiss: close ANY open thread
+				// surface in this feed scope, never open one. The Thread
+				// button is the explicit opener. Closing only this card's
+				// own surface left threads opened from other rows stuck.
 				if (isInteractiveTarget(event.target)) return;
-				conversation.toggle();
+				if (conversation.isOpen) {
+					conversation.toggle();
+				} else {
+					conversation.closeAny();
+				}
 			}}
 		>
 			<AvatarChip

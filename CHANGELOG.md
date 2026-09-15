@@ -2,6 +2,10 @@
 
 ## 0.12.4 - Unreleased
 
+### Fixes
+
+- Make plain-text taps on timeline rows dismiss-only on touch devices: tapping unlinked tweet text closes any open conversation surface in the feed (including one opened from another row) and never opens a thread; the Thread button remains the explicit opener.
+
 ## 0.12.3 - 2026-09-07
 
 ### Highlights
