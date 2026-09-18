@@ -7,11 +7,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
 import { getConversationThread, listDmConversations } from "./dm-read-model";
 import { getNativeDb, resetDatabaseForTests } from "./db";
+import { refreshSearchRows } from "./search-index";
 
 const listDirectMessagesViaBirdMock = vi.fn();
 const getAuthenticatedBirdAccountMock = vi.fn();
 const listDirectMessageEventsViaXurlMock = vi.fn();
 const lookupAuthenticatedUserMock = vi.fn();
+const readWebDirectMessagesMock = vi.fn();
+
+vi.mock("./x-web-dms", () => ({
+	readWebDirectMessages: (...args: unknown[]) =>
+		readWebDirectMessagesMock(...args),
+}));
 
 vi.mock("./bird", async () => {
 	const { effectFromMock } = await import("../test/effect-mocks");
@@ -60,6 +67,9 @@ function mockRepeatedXurlDmPages() {
 
 describe("cached live DMs", () => {
 	beforeEach(() => {
+		vi.stubEnv("AUTH_TOKEN", "");
+		vi.stubEnv("CT0", "");
+		readWebDirectMessagesMock.mockReset();
 		listDirectMessagesViaBirdMock.mockReset();
 		getAuthenticatedBirdAccountMock.mockReset();
 		listDirectMessageEventsViaXurlMock.mockReset();
@@ -75,6 +85,7 @@ describe("cached live DMs", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		resetDatabaseForTests();
 		resetBirdclawPathsForTests();
 		delete process.env.BIRDCLAW_HOME;
@@ -82,6 +93,77 @@ describe("cached live DMs", () => {
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	it("falls back from failed native requests to independently verified Bird in auto mode", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("expired native session"),
+		);
+		listDirectMessagesViaBirdMock.mockResolvedValue({
+			success: true,
+			conversations: [],
+			events: [],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				inbox: "requests",
+				mode: "auto",
+				refresh: true,
+			}),
+		).resolves.toMatchObject({ source: "bird", messages: 0 });
+		expect(getAuthenticatedBirdAccountMock).toHaveBeenCalledTimes(1);
+		expect(readWebDirectMessagesMock).toHaveBeenCalledTimes(1);
+		expect(listDirectMessageEventsViaXurlMock).not.toHaveBeenCalled();
+	});
+
+	it("falls back to xurl after a preferred native full-inbox read fails", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("native metadata unavailable"),
+		);
+		listDirectMessageEventsViaXurlMock.mockResolvedValue({
+			data: [],
+			meta: { result_count: 0 },
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "auto", refresh: true }),
+		).resolves.toMatchObject({ source: "xurl", messages: 0 });
+		expect(readWebDirectMessagesMock).toHaveBeenCalledTimes(1);
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps explicit native failures and rejects wrong-account Bird fallbacks", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("native unavailable"),
+		);
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "web", refresh: true }),
+		).rejects.toThrow("native unavailable");
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
+		expect(lookupAuthenticatedUserMock).not.toHaveBeenCalled();
+		getAuthenticatedBirdAccountMock.mockResolvedValue({
+			id: "999",
+			username: "other",
+		});
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				mode: "auto",
+				inbox: "requests",
+				refresh: true,
+			}),
+		).rejects.toThrow("refusing to sync");
+		expect(listDirectMessagesViaBirdMock).not.toHaveBeenCalled();
 	});
 
 	it("keeps cached DM sync effects lazy", async () => {
@@ -107,6 +189,110 @@ describe("cached live DMs", () => {
 			messages: 0,
 		});
 		expect(listDirectMessagesViaBirdMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("refreshes a large DM search batch, removes previews, deduplicates events, and rolls back failures", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		const conversationId = "25401953-55";
+		const event = (id: string, text: string) => ({
+			id,
+			conversationId,
+			text,
+			createdAt: "2026-09-13T20:00:00.000Z",
+			senderId: "55",
+			recipientId: "25401953",
+		});
+		const events = Array.from({ length: 1200 }, (_, index) =>
+			event(`batch_dm_${index}`, `Batch search text ${index}`),
+		);
+		events.push(event("batch_dm_0", "Final duplicate text"));
+		listDirectMessagesViaBirdMock.mockResolvedValue({
+			success: true,
+			conversations: [
+				{
+					id: conversationId,
+					participants: [
+						{ id: "25401953", username: "steipete" },
+						{ id: "55", username: "syntheticpeer" },
+					],
+				},
+			],
+			events,
+		});
+		db.exec(`
+			insert into dm_messages(id,conversation_id,sender_profile_id,text,created_at,direction) values
+				('batch_dm_0','25401953-55','profile_me','obsolete','','inbound'),
+				('preview:25401953-55','25401953-55','profile_me','old preview','','inbound'),
+				('unrelated_dm','dm_001','profile_me','keep sentinel','','inbound');
+		`);
+		refreshSearchRows(db, "dm", [
+			"batch_dm_0",
+			"preview:25401953-55",
+			"unrelated_dm",
+		]);
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		const prepare = vi.spyOn(db, "prepare");
+		try {
+			await syncDirectMessagesViaCachedBird({ mode: "bird", refresh: true });
+			expect(
+				prepare.mock.calls.filter(([sql]) =>
+					/^\s*delete from dm_fts/i.test(sql),
+				),
+			).toHaveLength(1);
+		} finally {
+			prepare.mockRestore();
+		}
+		expect(
+			db.prepare("select text from dm_fts where message_id='batch_dm_0'").all(),
+		).toEqual([{ text: "Final duplicate text" }]);
+		expect(
+			db
+				.prepare("select text from dm_fts where message_id=?")
+				.all(`preview:${conversationId}`),
+		).toEqual([]);
+		expect(
+			db
+				.prepare(
+					"select count(*) n from dm_fts where message_id like 'batch_dm_%'",
+				)
+				.get(),
+		).toEqual({ n: 1200 });
+		expect(
+			db
+				.prepare("select text from dm_fts where message_id='unrelated_dm'")
+				.get(),
+		).toEqual({ text: "keep sentinel" });
+		expect(
+			db
+				.prepare("select message_id from dm_fts where dm_fts match 'Final'")
+				.all(),
+		).toEqual([{ message_id: "batch_dm_0" }]);
+
+		const originalPrepare = db.prepare.bind(db);
+		const failInsert = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+			const statement = originalPrepare(sql);
+			if (sql.includes("insert into dm_fts")) {
+				statement.run = () => {
+					throw new Error("synthetic index failure");
+				};
+			}
+			return statement;
+		});
+		events.push(event("batch_dm_0", "Rolled back change"));
+		try {
+			await expect(
+				syncDirectMessagesViaCachedBird({ mode: "bird", refresh: true }),
+			).rejects.toThrow("synthetic index failure");
+		} finally {
+			failInsert.mockRestore();
+		}
+		expect(
+			db.prepare("select text from dm_messages where id='batch_dm_0'").get(),
+		).toEqual({ text: "Final duplicate text" });
+		expect(
+			db.prepare("select text from dm_fts where message_id='batch_dm_0'").all(),
+		).toEqual([{ text: "Final duplicate text" }]);
 	});
 
 	it("fetches bird DMs, caches them, and syncs them into the local store", async () => {
@@ -206,7 +392,7 @@ describe("cached live DMs", () => {
 		]);
 	});
 
-	it("fetches recent xurl DM events into the local store", async () => {
+	it("defaults to xurl DM events without requiring bird", async () => {
 		makeTempHome();
 		listDirectMessageEventsViaXurlMock.mockResolvedValueOnce({
 			data: [
@@ -232,7 +418,6 @@ describe("cached live DMs", () => {
 
 		const summary = await syncDirectMessagesViaCachedBird({
 			account: "acct_primary",
-			mode: "xurl",
 			limit: 5,
 			refresh: true,
 		});
@@ -270,6 +455,8 @@ describe("cached live DMs", () => {
 				sender: expect.objectContaining({ handle: "sam" }),
 			}),
 		]);
+		expect(listDirectMessagesViaBirdMock).not.toHaveBeenCalled();
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
 	});
 
 	it("paginates xurl DM events when requested", async () => {

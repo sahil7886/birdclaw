@@ -1,3 +1,4 @@
+import { parseJsonField } from "./json-codec";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Effect } from "effect";
@@ -7,6 +8,7 @@ import { listTimelineItems } from "./timeline-read-model";
 import { lookupTweetsByIdsEffect } from "./tweet-lookup";
 import { renderTweetMarkdown, renderTweetPlainText } from "./tweet-render";
 import type { TweetEntities, XurlMentionUser } from "./types";
+import { tweetContentFromXurl } from "./x-tweet-content";
 
 type ResearchNodeSource = "local" | "live";
 
@@ -82,18 +84,6 @@ function trySync<T>(try_: () => T) {
 		try: try_,
 		catch: (cause) => cause,
 	});
-}
-
-function parseJsonField<T>(value: unknown, fallback: T): T {
-	if (typeof value !== "string" || value.length === 0) {
-		return fallback;
-	}
-
-	try {
-		return JSON.parse(value) as T;
-	} catch {
-		return fallback;
-	}
 }
 
 function normalizeTweetEntities(raw: unknown): TweetEntities {
@@ -312,7 +302,8 @@ function lookupTweetNodeEffect(
 		if (!tweet) {
 			return null;
 		}
-		const entities = normalizeTweetEntities(tweet.entities);
+		const content = tweetContentFromXurl(tweet);
+		const entities = content.entities;
 
 		const usersById = new Map(
 			(payload.includes?.users ?? []).map((user: XurlMentionUser) => [
@@ -332,9 +323,9 @@ function lookupTweetNodeEffect(
 			authorHandle: author.username,
 			authorName: author.name,
 			createdAt: tweet.created_at,
-			text: tweet.text,
-			plainText: renderTweetPlainText(tweet.text, entities),
-			markdown: renderTweetMarkdown(tweet.text, entities),
+			text: content.text,
+			plainText: renderTweetPlainText(content.text, entities),
+			markdown: renderTweetMarkdown(content.text, entities),
 			likeCount: Number(tweet.public_metrics?.like_count ?? 0),
 			bookmarked: false,
 			liked: false,

@@ -197,13 +197,7 @@ async function runStep({
 	try {
 		if (kind === "timeline") {
 			const timelineMode =
-				mode === "auto"
-					? account
-						? allowBirdAccount
-							? "bird"
-							: "xurl"
-						: "auto"
-					: mode;
+				mode === "auto" ? (allowBirdAccount ? "auto" : "xurl") : mode;
 			if (timelineMode === "bird" && !allowBirdAccount) {
 				return { kind, ok: false, count: 0, error: birdAccountError(kind) };
 			}
@@ -230,6 +224,7 @@ async function runStep({
 			const mentionMode =
 				mode === "auto" ? (allowBirdAccount ? "auto" : "xurl") : mode;
 			const result = await syncMentions({
+				intent: "latest",
 				account,
 				mode: mentionMode,
 				limit,

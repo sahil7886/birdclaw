@@ -1,3 +1,4 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
 import {
 	keepPreviousData,
@@ -7,11 +8,12 @@ import {
 } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useSelectedAccountId } from "#/components/account-selection";
+import { useQueryAccount } from "#/components/account-selection";
 import { InboxCard } from "#/components/InboxCard";
 import { inboxResponseSchema } from "#/lib/api-contracts";
 import { fetchJson, fetchQueryEnvelope, postAction } from "#/lib/api-client";
 import { queryKeys } from "#/lib/query-client";
+import { useDeploymentMode } from "#/lib/deployment-mode";
 import {
 	type InboxRouteSearch,
 	type RouteSearchChange,
@@ -69,10 +71,12 @@ export function InboxRouteView({
 	onSearchChange?: RouteSearchChange<InboxRouteSearch>;
 } = {}) {
 	const queryClient = useQueryClient();
-	const [localSearch, setLocalSearch] = useState(() => validateInboxSearch({}));
-	const searchState = controlledSearch ?? localSearch;
-	const updateSearch: RouteSearchChange<InboxRouteSearch> = (next, options) =>
-		onSearchChange ? onSearchChange(next, options) : setLocalSearch(next);
+	const { readOnly } = useDeploymentMode();
+	const { searchState, updateSearch, textInput } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateInboxSearch,
+	);
 	const { kind, minScore, hideLowSignal } = searchState;
 	const [activeReplyId, setActiveReplyId] = useState<string | null>(null);
 	const [replyDraft, setReplyDraft] = useState("");
@@ -83,7 +87,8 @@ export function InboxRouteView({
 		queryFn: ({ signal }) => fetchQueryEnvelope({ signal }),
 	});
 	const meta = statusQuery.data ?? null;
-	const selectedAccountId = useSelectedAccountId(meta?.accounts);
+	const { selectedAccountId, accountSelectionSettled } =
+		useQueryAccount(statusQuery);
 	const inboxQueryKey = [
 		...queryKeys.inbox,
 		{
@@ -95,6 +100,7 @@ export function InboxRouteView({
 	] as const;
 	const inboxQuery = useQuery({
 		queryKey: inboxQueryKey,
+		enabled: accountSelectionSettled,
 		queryFn: async ({ signal }) => {
 			const url = new URL("/api/inbox", window.location.origin);
 			url.searchParams.set("kind", kind);
@@ -179,6 +185,7 @@ export function InboxRouteView({
 					<button
 						className={primaryButtonClass}
 						disabled={scoreMutation.isPending}
+						hidden={readOnly}
 						onClick={() => void scoreNow()}
 						type="button"
 					>
@@ -190,14 +197,8 @@ export function InboxRouteView({
 					<input
 						className={cx(textFieldClass, textFieldShortClass)}
 						inputMode="numeric"
-						onChange={(event) =>
-							updateSearch(
-								{ ...searchState, minScore: event.target.value },
-								{ replace: true },
-							)
-						}
+						{...textInput("minScore")}
 						placeholder="Min AI score"
-						value={minScore}
 					/>
 					<button
 						className={secondaryButtonClass}

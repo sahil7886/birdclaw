@@ -56,6 +56,7 @@ const listTimelineItemsMock = vi.fn();
 const listDmConversationsMock = vi.fn();
 const applyDmRequestMutationToLocalStoreMock = vi.fn();
 const runDirectMessageRequestMutationViaBirdMock = vi.fn();
+const mutateWebDirectMessageMock = vi.fn();
 const getAuthenticatedBirdAccountMock = vi.fn();
 const getConversationThreadMock = vi.fn();
 const hydrateProfilesFromXMock = vi.fn();
@@ -356,6 +357,11 @@ vi.mock("#/lib/bird", () => ({
 		runDirectMessageRequestMutationViaBirdMock(...args),
 }));
 
+vi.mock("#/lib/x-web-dms", () => ({
+	mutateWebDirectMessage: (...args: unknown[]) =>
+		mutateWebDirectMessageMock(...args),
+}));
+
 vi.mock("#/lib/timeline-collections-live", () => ({
 	syncTimelineCollection: (...args: unknown[]) =>
 		syncTimelineCollectionMock(...args),
@@ -435,6 +441,7 @@ describe("cli", () => {
 		listDmConversationsMock.mockReset();
 		applyDmRequestMutationToLocalStoreMock.mockReset();
 		runDirectMessageRequestMutationViaBirdMock.mockReset();
+		mutateWebDirectMessageMock.mockReset().mockResolvedValue({ success: true });
 		getAuthenticatedBirdAccountMock.mockReset();
 		getConversationThreadMock.mockReset();
 		hydrateProfilesFromXMock.mockReset();
@@ -757,6 +764,7 @@ describe("cli", () => {
 			host: "127.0.0.1",
 			port: 3000,
 			serverVersion: packageVersion,
+			json: false,
 			onListening: expect.any(Function),
 		});
 		expect(getNativeDbMock).toHaveBeenCalledWith({ seedDemoData: false });
@@ -778,7 +786,10 @@ describe("cli", () => {
 			"Find likely Twitter archives on disk",
 		);
 		expect(db?.description()).toBe("Inspect local storage");
-		expect(db?.commands.map((command) => command.name())).toEqual(["stats"]);
+		expect(db?.commands.map((command) => command.name())).toEqual([
+			"stats",
+			"vacuum",
+		]);
 		expect(db?.commands[0]?.description()).toBe(
 			"Show local storage and dataset stats",
 		);
@@ -1342,8 +1353,70 @@ describe("cli", () => {
 		await runCli(["node", "birdclaw", "--version"]);
 
 		expect(stdoutWriteMock).toHaveBeenCalledWith(`${packageVersion}\n`);
-		expect(exitMock).toHaveBeenCalledWith(0);
+		expect(exitMock).not.toHaveBeenCalled();
 		stdoutWriteMock.mockRestore();
+		exitMock.mockRestore();
+	});
+
+	it.each([
+		["--json", "not-a-command"],
+		["search", "tweets", "--invalid", "--json"],
+		["backup", "export", "--json"],
+		["show", "tweet", "--json"],
+		["--json"],
+		["search", "--json"],
+	])("reports parser failures as JSON: %j", async (...args) => {
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { runCliMain } = await loadCli();
+		await runCliMain(["node", "birdclaw", ...args]);
+		expect(process.exitCode).toBe(2);
+		expect(error).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(String(error.mock.calls[0]?.[0]))).toEqual({
+			error: expect.any(String),
+		});
+		expect(String(error.mock.calls[0]?.[0])).not.toContain("(outputHelp)");
+		expect(consoleLogMock).not.toHaveBeenCalled();
+		expect(getNativeDbMock).not.toHaveBeenCalled();
+		error.mockRestore();
+	});
+
+	it("reports runtime failures as JSON", async () => {
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		getQueryEnvelopeMock.mockRejectedValueOnce(
+			new Error("database unavailable"),
+		);
+		const { runCliMain } = await loadCli();
+		await runCliMain(["node", "birdclaw", "db", "stats", "--json"]);
+		expect(process.exitCode).toBe(1);
+		expect(error).toHaveBeenCalledWith(
+			JSON.stringify({ error: "database unavailable" }),
+		);
+		error.mockRestore();
+	});
+
+	it("shows global JSON help on nested commands", async () => {
+		const { program } = await loadCli();
+		const search = program.commands.find(
+			(command) => command.name() === "search",
+		);
+		const tweets = search?.commands.find(
+			(command) => command.name() === "tweets",
+		);
+		expect(tweets?.helpInformation()).toContain("--json");
+	});
+
+	it("passes JSON mode to the production server and rejects out-of-range ports", async () => {
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { runCli } = await loadCli();
+		await runCli(["node", "birdclaw", "serve", "--port", "0", "--json"]);
+		expect(runProductionServerMock).toHaveBeenCalledWith(
+			expect.objectContaining({ port: 0, json: true }),
+		);
+		runProductionServerMock.mockClear();
+		await runCli(["node", "birdclaw", "serve", "--port", "65536", "--json"]);
+		expect(process.exitCode).toBe(2);
+		expect(runProductionServerMock).not.toHaveBeenCalled();
+		error.mockRestore();
 	});
 
 	it("imports the latest archive when no path is provided", async () => {
@@ -1490,6 +1563,27 @@ describe("cli", () => {
 			count: 1,
 			partial: false,
 		});
+	});
+
+	it("dispatches explicit latest and resume mention intents and rejects combining them", async () => {
+		const { runCli } = await loadCli();
+		syncMentionsMock.mockResolvedValue({ ok: true, partial: false });
+		for (const intent of ["latest", "resume"]) {
+			await runCli(["node", "birdclaw", "sync", "mentions", `--${intent}`]);
+			expect(syncMentionsMock).toHaveBeenLastCalledWith(
+				expect.objectContaining({ intent }),
+			);
+		}
+		await runCli([
+			"node",
+			"birdclaw",
+			"sync",
+			"mentions",
+			"--latest",
+			"--resume",
+		]);
+		expect(process.exitCode).toBe(1);
+		expect(syncMentionsMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("marks capped sync mentions as partial", async () => {
@@ -2327,14 +2421,14 @@ describe("cli", () => {
 		});
 		expect(syncDirectMessagesViaCachedBirdMock).toHaveBeenCalledWith({
 			account: "acct_primary",
-			mode: "bird",
+			mode: "auto",
 			limit: 12,
 			refresh: true,
 			cacheTtlMs: 120_000,
 		});
 		expect(syncDirectMessagesViaCachedBirdMock).toHaveBeenCalledWith({
 			account: "acct_primary",
-			mode: "bird",
+			mode: "auto",
 			limit: 7,
 			refresh: true,
 			cacheTtlMs: 45_000,
@@ -2418,7 +2512,15 @@ describe("cli", () => {
 	it("updates local DM request state after live mutations", async () => {
 		const { runCli } = await loadCli();
 
-		await runCli(["node", "birdclaw", "dms", "accept", "dm_1"]);
+		await runCli([
+			"node",
+			"birdclaw",
+			"dms",
+			"accept",
+			"dm_1",
+			"--mode",
+			"bird",
+		]);
 
 		expect(runDirectMessageRequestMutationViaBirdMock).toHaveBeenCalledWith({
 			action: "accept",
@@ -2443,6 +2545,8 @@ describe("cli", () => {
 			"dm_1",
 			"--max-pages",
 			"8",
+			"--mode",
+			"bird",
 		]);
 
 		expect(runDirectMessageRequestMutationViaBirdMock).toHaveBeenCalledWith({
@@ -2459,8 +2563,42 @@ describe("cli", () => {
 		});
 		const { runCli } = await loadCli();
 
-		await runCli(["node", "birdclaw", "dms", "reject", "dm_1"]);
+		await runCli([
+			"node",
+			"birdclaw",
+			"dms",
+			"reject",
+			"dm_1",
+			"--mode",
+			"bird",
+		]);
 
+		expect(applyDmRequestMutationToLocalStoreMock).not.toHaveBeenCalled();
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("uses native DM request actions by default and only records confirmed success", async () => {
+		const { runCli } = await loadCli();
+		await runCli(["node", "birdclaw", "dms", "accept", "dm_1"]);
+		expect(mutateWebDirectMessageMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				conversationId: "dm_1",
+				action: "accept",
+				account: expect.objectContaining({ accountId: "acct_primary" }),
+			}),
+		);
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
+		expect(runDirectMessageRequestMutationViaBirdMock).not.toHaveBeenCalled();
+		expect(applyDmRequestMutationToLocalStoreMock).toHaveBeenCalledWith(
+			"dm_1",
+			"accept",
+		);
+		applyDmRequestMutationToLocalStoreMock.mockClear();
+		mutateWebDirectMessageMock.mockResolvedValueOnce({
+			success: false,
+			error: "unconfirmed",
+		});
+		await runCli(["node", "birdclaw", "dms", "reject", "dm_1"]);
 		expect(applyDmRequestMutationToLocalStoreMock).not.toHaveBeenCalled();
 		expect(process.exitCode).toBe(1);
 	});
@@ -2973,7 +3111,75 @@ describe("cli", () => {
 		},
 	);
 
-	it("preserves lenient link search limit coercion", async () => {
+	it.each([
+		["dms", "list", "--limit", "-1"],
+		["dms", "list", "--limit", "NaN"],
+		["dms", "list", "--limit", ""],
+		["dms", "list", "--limit", " "],
+		["dms", "list", "--limit", "9007199254740992"],
+		["dms", "list", "--min-influence-score", "NaN"],
+		["dms", "sync", "--cache-ttl", "-1"],
+		["search", "dms", "query", "--max-influence-score", "Infinity"],
+		["graph", "top-followers", "--limit", "-1"],
+		["lists", "members", "--limit", "1.5"],
+		["mentions", "export", "--max-pages", "-1"],
+		["sync", "timeline", "--max-pages", "NaN"],
+		["sync", "lists", "--delay-ms", "-1"],
+		["jobs", "install-account-launchd", "--limit", "bad"],
+		["inbox", "--min-score", ""],
+		["research", "--thread-depth", "bad"],
+		["media", "fetch", "--max-bytes", "Infinity"],
+		["blocks", "list", "--limit", "-1"],
+		["whois", "query", "--context", "-1"],
+		["show", "thread", "tweet_001", "--limit", "-1"],
+	])(
+		"validates numeric input before account selection or I/O: %j",
+		async (...args) => {
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			getDefaultAccountSelectorMock.mockReturnValue("missing");
+			const { runCli } = await loadCli();
+			await runCli(["node", "birdclaw", ...args, "--json"]);
+			expect(process.exitCode).toBe(1);
+			expect(error).toHaveBeenCalledTimes(1);
+			expect(JSON.parse(String(error.mock.lastCall?.[0])).error).toContain(
+				"must be",
+			);
+			expect(resolveOperationAccountMock).not.toHaveBeenCalled();
+			expect(getNativeDbMock).not.toHaveBeenCalled();
+			expect(maybeAutoUpdateBackupMock).not.toHaveBeenCalled();
+			expect(installAccountSyncLaunchAgentMock).not.toHaveBeenCalled();
+			expect(syncDirectMessagesViaCachedBirdMock).not.toHaveBeenCalled();
+			expect(consoleLogMock).not.toHaveBeenCalled();
+			error.mockRestore();
+		},
+	);
+
+	it("preserves fractional thresholds and cache TTLs", async () => {
+		const { runCli } = await loadCli();
+		await runCli([
+			"node",
+			"birdclaw",
+			"dms",
+			"list",
+			"--refresh",
+			"--limit",
+			"5",
+			"--min-influence-score",
+			"2.5",
+			"--cache-ttl",
+			"0.5",
+			"--json",
+		]);
+		expect(process.exitCode).toBe(0);
+		expect(syncDirectMessagesViaCachedBirdMock).toHaveBeenCalledWith(
+			expect.objectContaining({ limit: 5, cacheTtlMs: 500 }),
+		);
+		expect(listDmConversationsMock).toHaveBeenCalledWith(
+			expect.objectContaining({ minInfluenceScore: 2.5 }),
+		);
+	});
+
+	it("rejects fractional link search limits before reading", async () => {
 		const consoleErrorMock = vi
 			.spyOn(console, "error")
 			.mockImplementation(() => {});
@@ -2989,12 +3195,12 @@ describe("cli", () => {
 			"2.7",
 		]);
 
-		expect(consoleErrorMock).not.toHaveBeenCalled();
-		expect(process.exitCode).not.toBe(1);
-		expect(searchLinksMock).toHaveBeenCalledWith(
-			"query",
-			expect.objectContaining({ limit: 2.7 }),
+		expect(consoleErrorMock).toHaveBeenCalledWith(
+			JSON.stringify({ error: "--limit must be a non-negative integer" }),
 		);
+		expect(process.exitCode).toBe(1);
+		expect(searchLinksMock).not.toHaveBeenCalled();
+		expect(maybeAutoUpdateBackupMock).not.toHaveBeenCalled();
 		consoleErrorMock.mockRestore();
 	});
 

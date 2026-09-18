@@ -9,8 +9,7 @@ import {
 	useState,
 } from "react";
 import { tweetConversationResponseSchema } from "#/lib/api-contracts";
-import { fetchJsonEffect } from "#/lib/api-client";
-import { runEffectPromise } from "./effect-runtime";
+import { fetchJson } from "#/lib/api-client";
 import { queryKeys } from "./query-client";
 
 type ConversationStatus = "idle" | "loading" | "ready" | "error";
@@ -27,14 +26,12 @@ export function conversationQueryOptions(tweetId: string) {
 	return queryOptions({
 		queryKey: [...queryKeys.conversations, tweetId] as const,
 		queryFn: () =>
-			runEffectPromise(
-				fetchJsonEffect(
-					`/api/conversation?tweetId=${encodeURIComponent(tweetId)}`,
-					undefined,
-					tweetConversationResponseSchema,
-					"Conversation unavailable",
-				),
-			).then((data) => data.items),
+			fetchJson(
+				`/api/conversation?tweetId=${encodeURIComponent(tweetId)}`,
+				undefined,
+				tweetConversationResponseSchema,
+				"Conversation unavailable",
+			),
 		staleTime: Number.POSITIVE_INFINITY,
 	});
 }
@@ -76,9 +73,6 @@ export function useConversationSurface(surfaceId: string, tweetId = surfaceId) {
 	const toggle = useCallback(() => {
 		setExpandedSurfaceId(isOpen ? null : surfaceId);
 	}, [isOpen, setExpandedSurfaceId, surfaceId]);
-	// Dismiss any open conversation surface in this feed scope (single-open
-	// scope), so a plain-text tap anywhere in the feed closes the stuck
-	// thread even when it was opened from a different timeline row.
 	const closeAny = useCallback(() => {
 		setExpandedSurfaceId(null);
 	}, [setExpandedSurfaceId]);
@@ -97,7 +91,7 @@ export function useConversationSurface(surfaceId: string, tweetId = surfaceId) {
 		closeAny,
 		error: query.error instanceof Error ? query.error.message : null,
 		isOpen,
-		items: query.data ?? [],
+		items: query.data?.items ?? [],
 		loading: query.isFetching,
 		prefetch,
 		status,

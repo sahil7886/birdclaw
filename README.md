@@ -76,6 +76,10 @@ SQLite is the canonical store. Archive imports and live transports converge on t
 
 Local reads do not trigger network traffic by default. The web server listens on loopback, live writes can be disabled with `BIRDCLAW_DISABLE_LIVE_WRITES=1`, and the MCP endpoint remains off until its token and public URL are configured.
 
+Bird is optional: xurl supports ordinary live workflows and moderation, while native `web` access handles DM requests using `AUTH_TOKEN` and `CT0` session cookies. Neither native request access nor xurl moderation needs a browser process. See [running without bird](https://birdclaw.sh/auth.html#run-without-bird).
+
+For an archive-only server, set `BIRDCLAW_DEPLOYMENT_READ_ONLY=1` before `birdclaw serve`. This opt-in mode serves an initialized archive through strict readers, disables web mutations and automatic sync, and hides unavailable controls. See [read-only archive deployments](https://birdclaw.sh/configuration.html#read-only-archive-deployments) for its authentication and storage requirements.
+
 ## Configuration
 
 `~/.birdclaw/config.json` selects default accounts, transport preferences, mention sources, and backup behavior. Command flags override environment variables, which override the config file.
@@ -90,6 +94,10 @@ See [Configuration](https://birdclaw.sh/configuration.html) for the complete fil
 ./scripts/bun-canary.sh run --bun test
 ./scripts/bun-canary.sh run --bun build
 ```
+
+Vite generates the compact app/favicon logo from the original artwork during configuration. The derivative lives in `.generated/birdclaw-brand/` and is emitted with a content hash; the full-resolution documentation image remains unchanged. Sharp is a build-only dependency.
+
+The CLI build bundles the Effect modules it uses to reduce process startup work. Other direct dependencies remain external, and the installed package keeps the same Node and Bun runtime contracts.
 
 The wrapper installs and verifies the exact Rust-port canary recorded in `toolchains/bun-canary.conf`; it refuses a newer rolling canary with a different checksum or revision. CI also runs Bun/Istanbul and Node/V8 coverage, dual-runtime installed-package smoke, and Playwright against the Bun production server.
 

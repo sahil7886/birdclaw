@@ -28,6 +28,8 @@ birdclaw [global flags] <subcommand> [args]
 - `--version`
 - `--json`
 
+Global flags work before or after subcommands, for example `birdclaw --json db stats` and `birdclaw db stats --json`. Nested `--help` output includes the available global flags. Use `--` before positional values that start with a dash; a literal `--json` after that separator is data, not an output flag. Help and version requests always return text.
+
 ## Config precedence
 
 Command flags > environment overrides > user config
@@ -55,10 +57,8 @@ birdclaw auth status
 birdclaw auth use <transport>
 birdclaw import archive [path]
 birdclaw import tweet <tweet-id-or-url...> --fxtwitter
-birdclaw sync all
-birdclaw sync tweets
 birdclaw sync authored
-birdclaw sync dms
+birdclaw dms sync
 birdclaw sync bookmarks
 birdclaw sync likes
 birdclaw sync timeline
@@ -69,7 +69,6 @@ birdclaw sync following
 birdclaw sync lists
 birdclaw lists list
 birdclaw lists members [name]
-birdclaw import tweet <tweet-id-or-url...> --fxtwitter
 birdclaw import thread <tweet-id-or-url> --fxtwitter
 birdclaw import conversation <tweet-id-or-url> --fxtwitter
 birdclaw import profile <handle> --fxtwitter
@@ -108,7 +107,10 @@ birdclaw backup export --repo <path>
 birdclaw backup sync --repo <path> --remote <url>
 birdclaw backup import <path>
 birdclaw backup validate <path>
-birdclaw debug transport
+birdclaw jobs sync-account
+birdclaw jobs sync-bookmarks
+birdclaw jobs install-account-launchd
+birdclaw jobs install-bookmarks-launchd
 ```
 
 ## Subcommand semantics
@@ -122,6 +124,7 @@ birdclaw debug transport
 - excludes DMs unless `--include-dms` is passed
 - supports `--refresh`, `--model`, `--language <locale-id>`, `--max-tweets`, and `--max-links`
 - reads the default report language from `BIRDCLAW_DIGEST_LANGUAGE`
+- reads the home-timeline transport default from `BIRDCLAW_DIGEST_LIVE_MODE` (`auto`, `bird`, or `xurl`); unset or invalid values keep `xurl`, and `--live-mode` overrides the environment
 
 ### `digest [period]`
 
@@ -129,6 +132,7 @@ birdclaw debug transport
 - accepts explicit `--since <iso>` and `--until <iso>` windows
 - caches the final structured result by local context hash, model, reasoning effort, service tier, and canonical report language
 - accepts the same language tag through `GET /api/period-digest?language=zh-CN`
+- accepts a home-timeline transport override through `GET /api/period-digest?liveSyncMode=bird`; mentions and mention threads still use xurl, and the Today web page remains local-only
 - `--json` suppresses token streaming and emits the final envelope
 
 ### `init`
@@ -140,6 +144,24 @@ birdclaw debug transport
 - print useful next commands for the selected setup path
 
 Account-capable commands accept `--account <username>` or a stored account ID. Set `accounts.default` in `config.json` for a reversible default; an explicit flag wins.
+
+Numeric flags are checked before account selection or command actions. Counts and limits require non-negative safe integers; command-specific positive minimums and caps still apply. Follower and score thresholds allow finite fractional values, and `--cache-ttl` allows non-negative fractional seconds. Blank values, `NaN`, infinity, negative counts, and fractional limits fail with a JSON error on stderr and exit code `1`.
+
+### `show tweet|thread|dm`
+
+Read records already stored in the selected account. An explicit `--account` overrides the configured default; otherwise the stored default account is used. Missing records and records belonging only to another account return a failure.
+
+```bash
+birdclaw show tweet 1891234567890 --json
+birdclaw show thread 1891234567890 --limit 80 --json
+birdclaw show dm <conversation-id> --account <username> --json
+```
+
+`show tweet` returns one tweet object. `show thread` returns `anchorId`, `items`, and `truncated`; its positive `--limit` defaults to 80, and only cached ancestors and replies are available. `show dm` returns `conversation` and the complete stored `messages` in chronological order. These commands follow the existing opt-in backup auto-update behavior described below.
+
+### `db vacuum`
+
+Reclaim unused SQLite space without changing archive contents. This can take time and requires a writable database; concurrent activity may cause a busy error. `--json` returns `{"ok":true,"operation":"vacuum"}` after completion.
 
 ### `import tweet <tweet-id-or-url...>`
 
@@ -233,8 +255,8 @@ Read commands pull + merge only when the last backup check is stale. Data-changi
 
 ### local `bird` command
 
-Live local likes, bookmarks, DMs, and moderation verification use `bird` on PATH
-by default. Override it with `BIRDCLAW_BIRD_COMMAND` or:
+Bird is an optional legacy transport. Explicit Bird modes and optional fallbacks
+look for `bird` on PATH. Override its location with `BIRDCLAW_BIRD_COMMAND` or:
 
 ```json
 {
@@ -314,9 +336,9 @@ birdclaw import archive ~/Downloads/twitter-archive.zip --select followers,follo
 - refresh FTS incrementally
 - `sync likes` and `sync bookmarks` use cached live transport; `auto` tries `xurl`, then `bird`; `--early-stop` caps at 10 pages unless paired with `--all` or `--max-pages`
 - `sync authored` uses `xurl`, includes retweets, and resumes from a stored `since_id`
-- `sync timeline` stores the live home timeline through `bird`; it defaults to the chronological Following feed
+- `sync timeline` stores the live home timeline through `auto` (xurl first, optional Bird fallback); it defaults to the chronological Following feed
 - `sync mentions` ingests recent mentions through `xurl` (default) or `bird` and writes `kind='mention'` rows into the canonical store; this is the cron-friendly ingest path that replaces relying on `mentions export --refresh`
-- `sync mention-threads` fetches conversation context for recent mentions through `bird thread` or `xurl`; pass `--mode xurl` when the `bird` CLI is unavailable, otherwise use `--delay-ms` and `--timeout-ms` to stay gentle on live X
+- `sync mention-threads` fetches conversation context for recent mentions through xurl by default; explicit `--mode bird` remains available, and `--delay-ms`/`--timeout-ms` bound live work
 - `sync followers` and `sync following` default to dry-run and require `--yes` for live sync or fresh-cache merge; `auto` prefers `bird`, then falls back to `xurl`
 - `sync lists` is an explicit read-only walk; it defaults to 20 members, one page, and 1,000 ms pacing per List, and stores `complete|inferred|partial|error` membership state
 
@@ -533,7 +555,9 @@ birdclaw discuss "prototype" --include-dms --limit 500 --max-pages 5 --json
 Find likely people or orgs from local DM and optional tweet evidence.
 Candidates include structured `profileEvidence` entries for profile bio, profile
 URL, bio URLs, location, verified type, first-class affiliations, bio entities,
-profile-history snapshots, DM context, and expanded URLs. `whois` also searches
+profile-history snapshots, DM context, and expanded URLs. Recent profile-history
+reads select only the requested rows per profile; the complete stored history
+remains available to archive exports. `whois` also searches
 significant terms from fuzzy prompts, so `blacksmith guy` can rank a match from
 `@useblacksmith` and `blacksmith.sh` even when the literal phrase was not stored
 in a DM. Query intent changes ranking: `@github` emphasizes handle and
@@ -675,7 +699,7 @@ birdclaw profiles replies @jpctan --limit 12 --json
 Flags:
 
 - `--refresh`
-- `--mode bird|xurl|auto`
+- `--mode web|bird|xurl|auto`
 - `--cache-ttl <seconds>`
 - `--participant <handle-or-id>`
 - `--min-followers <n>`
@@ -697,12 +721,12 @@ Flags:
 Flags:
 
 - `--account <account-id>`
-- `--mode bird|xurl|auto`
+- `--mode web|bird|xurl|auto`
 - `--limit <n>`
 - `--refresh`
 - `--cache-ttl <seconds>`
 
-`--mode bird` is the default and the only mode that can sync message requests. `--mode xurl` reads recent OAuth2 `/2/dm_events` as accepted conversations; `--mode auto` tries xurl first for accepted DMs and falls back to bird.
+`--mode auto` is the default. Native `--mode web` uses `AUTH_TOKEN` and `CT0` to read accepted DMs and message requests without a bird executable or browser. Auto selects native web for request/full-default-account inboxes when cookies are available; other reads use xurl with available fallback. `--mode xurl` reads recent OAuth2 `/2/dm_events`, which does not expose request state. `dms accept`, `dms reject`, and `dms block` default to native web; explicit `--mode bird` remains supported.
 
 ### `inbox`
 
@@ -807,6 +831,7 @@ Flags:
 - starts local app server
 - starts the built production SSR and static-asset server
 - stdout prints the listening URL
+- `--json` prints one startup object with `ok`, `host`, the actual bound `port`, and `url`; `--port 0` selects an available port
 
 Flags:
 
@@ -894,13 +919,15 @@ stderr:
 
 - default human output
 - `--json` stable machine-readable envelopes
-- `--plain` stable line-oriented text, no color
+- parser and uncaught runtime failures with `--json` emit `{"error":"message"}` on stderr and leave stdout empty; command-specific failure results retain their existing JSON shapes
+
+Successful output shapes are command-specific (objects or arrays). Progress and warnings stay on stderr. `--plain` is not currently implemented; use `--json` for scripting.
 
 ## Exit codes
 
 - `0` success
 - `1` runtime failure
-- `2` invalid usage / validation
+- `2` parser usage errors (unknown command/option, missing arguments/options) and invalid port range; older command-specific validation paths use `1`
 - `3` auth unavailable
 - `4` transport unavailable
 - `5` partial sync failure
@@ -912,7 +939,7 @@ birdclaw init
 birdclaw init --demo
 birdclaw auth status
 birdclaw import archive ~/Downloads/twitter-archive.zip --select tweets,directMessages
-birdclaw sync all --transport xurl
+birdclaw jobs sync-account --mode xurl
 birdclaw search tweets "openai" --since 2024-01-01 --limit 20
 birdclaw search tweets --since 2020-01-01 --until 2021-01-01 --originals-only --hide-low-quality --limit 500
 birdclaw search dms "invoice" --participant @someone --min-followers 1000

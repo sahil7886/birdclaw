@@ -1,8 +1,10 @@
 import { Effect } from "effect";
+import { ReadOnlyQueryCache } from "./read-only-query-cache";
 import type { QueryEnvelope } from "./api-contracts";
 import type { Database } from "./sqlite";
 import { findArchivesCachedEffect } from "./archive-finder";
 import { getReadDb } from "./db";
+import { isReadOnlyDeployment } from "./config";
 import { runEffectPromise, trySync } from "./effect-runtime";
 import type { AccountRecord } from "./types";
 import { getTransportStatusEffect } from "./xurl";
@@ -112,20 +114,43 @@ function readLocalQueryEnvelope(db: Database) {
 	})();
 }
 
+type LocalEnvelope = ReturnType<typeof readLocalQueryEnvelope>;
+const readOnlyEnvelopes = new ReadOnlyQueryCache();
+
+function readQueryEnvelope(db: Database, readOnly: boolean): LocalEnvelope {
+	if (!readOnly) return readLocalQueryEnvelope(db);
+	return JSON.parse(
+		readOnlyEnvelopes.read(db, "status", () =>
+			JSON.stringify(readLocalQueryEnvelope(db)),
+		),
+	) as LocalEnvelope;
+}
+
 export function getQueryEnvelopeEffect({
 	includeArchives = true,
 }: { includeArchives?: boolean } = {}): Effect.Effect<QueryEnvelope, unknown> {
 	return Effect.gen(function* () {
-		const local = yield* trySync(() => readLocalQueryEnvelope(getReadDb()));
+		const readOnly = isReadOnlyDeployment();
+		const local = yield* trySync(() =>
+			readQueryEnvelope(getReadDb(), readOnly),
+		);
 		const external = yield* Effect.all({
-			archives: includeArchives
-				? findArchivesCachedEffect()
-				: Effect.succeed([]),
-			transport: getTransportStatusEffect(),
+			archives:
+				includeArchives && !readOnly
+					? findArchivesCachedEffect()
+					: Effect.succeed([]),
+			transport: readOnly
+				? Effect.succeed({
+						installed: false,
+						availableTransport: "local" as const,
+						statusText: "Read-only cached archive",
+					})
+				: getTransportStatusEffect(),
 		});
 
 		return {
 			...local,
+			...(readOnly ? { readOnly: true } : {}),
 			archives: external.archives,
 			transport: external.transport,
 		};

@@ -1,4 +1,23 @@
 import { z } from "zod";
+import { isTweetPermalinkPath } from "./tweet-permalink";
+
+export const READ_ONLY_ARCHIVE_PAGES: readonly string[] = [
+	"/",
+	"/inbox",
+	"/mentions",
+	"/likes",
+	"/bookmarks",
+	"/links",
+	"/dms",
+	"/blocks",
+	"/network-map",
+];
+
+export function isReadOnlyArchivePage(pathname: string) {
+	return (
+		READ_ONLY_ARCHIVE_PAGES.includes(pathname) || isTweetPermalinkPath(pathname)
+	);
+}
 
 export const resourceKindSchema = z.enum([
 	"home",

@@ -1,4 +1,7 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
+import { AvatarChip } from "#/components/AvatarChip";
 import { createFileRoute } from "@tanstack/react-router";
+import { useDeploymentMode } from "#/lib/deployment-mode";
 import {
 	Globe2,
 	MapPin,
@@ -11,14 +14,14 @@ import {
 	type CSSProperties,
 	useCallback,
 	useEffect,
-	useMemo,
 	useRef,
 	useState,
 } from "react";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { MapRef } from "react-map-gl/mapbox";
 import { useNetworkMapController } from "#/components/network-map-controller";
-import type { NetworkMapResponse } from "#/lib/api-contracts";
+import { formatNumber } from "#/lib/present";
+import type { NetworkMapViewResponse } from "#/lib/api-contracts";
 import {
 	type NetworkMapRouteSearch,
 	type RouteSearchChange,
@@ -43,23 +46,14 @@ import {
 } from "#/lib/ui";
 
 import {
-	CLUSTER_LEAF_SAMPLE_SIZE,
 	WORLD_VIEWPORT,
 	type ClusterAggregateProperties,
-	type ClusterResult,
 	type MapFeature,
 	type MapViewport,
 	type ReactMapboxModule,
 	type SelectedOverlay,
-	avatarInitial,
-	avatarPath,
-	buildClusterIndex,
 	clusterGradient,
-	compareClusterFeatures,
-	formatNumber,
 	formatRelationship,
-	getClusterDisplayAnchor,
-	isCluster,
 	readViewport,
 	relationshipColor,
 } from "#/components/network-map-model";
@@ -91,11 +85,12 @@ function StatTile({
 	);
 }
 
-function useMapboxModule() {
+function useMapboxModule(enabled: boolean) {
 	const [module, setModule] = useState<ReactMapboxModule | null>(null);
 	const [error, setError] = useState<string | null>(null);
 
 	useEffect(() => {
+		if (!enabled) return;
 		let cancelled = false;
 		import("react-map-gl/mapbox")
 			.then((loaded) => {
@@ -109,12 +104,12 @@ function useMapboxModule() {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [enabled]);
 
 	return { module, error };
 }
 
-function Avatar({
+function MapAvatar({
 	feature,
 	size = 36,
 	className,
@@ -125,29 +120,16 @@ function Avatar({
 	className?: string;
 	style?: CSSProperties;
 }) {
-	const src = avatarPath(feature);
-	const [failedSrc, setFailedSrc] = useState<string | null>(null);
-	const showImage = src && failedSrc !== src;
 	return (
-		<div
-			className={cx(
-				"relative grid shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--accent-soft)] text-[12px] font-bold text-[var(--accent)] ring-2 ring-white",
-				className,
-			)}
-			style={{ width: size, height: size, ...style }}
-		>
-			{showImage ? (
-				<img
-					src={src}
-					alt=""
-					className="h-full w-full object-cover"
-					loading="lazy"
-					onError={() => setFailedSrc(src)}
-				/>
-			) : (
-				<span>{avatarInitial(feature)}</span>
-			)}
-		</div>
+		<AvatarChip
+			profileId={feature.properties.profileId}
+			avatarUrl={feature.properties.avatarUrl ?? undefined}
+			name={feature.properties.name || feature.properties.handle || "?"}
+			variant="map"
+			size={size}
+			className={className}
+			style={style}
+		/>
 	);
 }
 
@@ -164,7 +146,7 @@ function ProfileMarker({ feature }: { feature: MapFeature }) {
 				className="absolute inset-0 rounded-full opacity-90 shadow-[0_10px_28px_rgba(15,20,25,0.28)]"
 				style={{ backgroundColor: color }}
 			/>
-			<Avatar feature={feature} size={34} className="relative ring-[3px]" />
+			<MapAvatar feature={feature} size={34} className="relative ring-[3px]" />
 		</button>
 	);
 }
@@ -195,7 +177,7 @@ function ClusterMarker({
 			<span className="absolute inset-[4px] rounded-full bg-white/88 backdrop-blur-sm" />
 			<span className="absolute inset-0 flex items-center justify-center">
 				{features.slice(0, 4).map((feature, index) => (
-					<Avatar
+					<MapAvatar
 						key={feature.properties.profileId}
 						feature={feature}
 						size={avatarSize}
@@ -217,27 +199,17 @@ function MapboxPanel({
 	data,
 	onViewportChange,
 }: {
-	data: NetworkMapResponse;
+	data: NetworkMapViewResponse;
 	onViewportChange: (viewport: MapViewport) => void;
 }) {
-	const { module, error } = useMapboxModule();
+	const { module, error } = useMapboxModule(Boolean(data.config.mapboxToken));
 	const mapRef = useRef<MapRef | null>(null);
 	const [viewport, setViewport] = useState<MapViewport>(WORLD_VIEWPORT);
 	const [selected, setSelected] = useState<SelectedOverlay | null>(null);
 
-	const clusterIndex = useMemo(() => buildClusterIndex(data.features), [data]);
-	const visibleClusters = useMemo(
-		() =>
-			clusterIndex.getClusters(
-				viewport.bounds,
-				Math.max(0, Math.floor(viewport.zoom)),
-			) as ClusterResult[],
-		[clusterIndex, viewport],
-	);
-
 	useEffect(() => {
 		setSelected(null);
-	}, [data]);
+	}, [data.meta.accountId, data.meta.type]);
 
 	const updateViewport = useCallback(
 		(event: { target: unknown }) => {
@@ -284,60 +256,44 @@ function MapboxPanel({
 				style={{ width: "100%", height: "100%" }}
 			>
 				<NavigationControl position="top-right" showCompass={false} />
-				{visibleClusters.map((item) => {
-					const [longitude, latitude] = item.geometry.coordinates;
-					if (isCluster(item)) {
-						const fallbackCoordinates = item.geometry.coordinates as [
-							number,
-							number,
-						];
-						const leaves = clusterIndex
-							.getLeaves(item.properties.cluster_id, CLUSTER_LEAF_SAMPLE_SIZE)
-							.map((leaf) => data.features[leaf.properties.featureIndex])
-							.filter((feature): feature is MapFeature => Boolean(feature))
-							.sort(compareClusterFeatures);
-						const [displayLongitude, displayLatitude] = getClusterDisplayAnchor(
-							leaves,
-							fallbackCoordinates,
-						);
+				{data.markers.map((item) => {
+					if (item.kind === "cluster") {
+						const [longitude, latitude] = item.coordinates;
 						return (
 							<Marker
-								key={`cluster-${String(item.properties.cluster_id)}`}
-								longitude={displayLongitude}
-								latitude={displayLatitude}
+								key={`cluster-${item.id}`}
+								longitude={longitude}
+								latitude={latitude}
 								anchor="center"
 								onClick={(event: { originalEvent?: Event }) => {
 									event.originalEvent?.stopPropagation();
-									const expansionZoom = Math.min(
-										clusterIndex.getClusterExpansionZoom(
-											item.properties.cluster_id,
-										),
-										12,
-									);
 									mapRef.current?.flyTo?.({
-										center: [displayLongitude, displayLatitude],
-										zoom: Math.max(viewport.zoom + 0.85, expansionZoom - 0.6),
+										center: item.coordinates,
+										zoom: Math.max(
+											viewport.zoom + 0.85,
+											Math.min(item.expansionZoom, 12) - 0.6,
+										),
 										duration: 520,
 									});
 									setSelected({
 										kind: "cluster",
-										coordinates: [displayLongitude, displayLatitude],
-										count: item.properties.point_count,
-										features: leaves,
-										stats: item.properties,
+										coordinates: item.coordinates,
+										count: item.count,
+										features: item.features,
+										stats: item.stats,
 									});
 								}}
 							>
 								<ClusterMarker
-									count={item.properties.point_count}
-									features={leaves}
-									stats={item.properties}
+									count={item.count}
+									features={item.features}
+									stats={item.stats}
 								/>
 							</Marker>
 						);
 					}
-					const feature = data.features[item.properties.featureIndex];
-					if (!feature) return null;
+					const feature = item.feature;
+					const [longitude, latitude] = feature.geometry.coordinates;
 					return (
 						<Marker
 							key={feature.properties.profileId}
@@ -385,11 +341,26 @@ function MapboxPanel({
 	);
 }
 
-function SvgMapFallback({ data }: { data: NetworkMapResponse }) {
-	const points = data.features.slice(0, 1500).map((feature) => {
-		const [lng, lat] = feature.geometry.coordinates;
+function SvgMapFallback({ data }: { data: NetworkMapViewResponse }) {
+	const points = data.markers.map((marker, index) => {
+		const [lng, lat] =
+			marker.kind === "cluster"
+				? marker.coordinates
+				: marker.feature.geometry.coordinates;
+		const count = marker.kind === "cluster" ? marker.count : 1;
+		const relationship =
+			marker.kind === "profile"
+				? marker.feature.properties.relationship
+				: marker.stats.mutual >=
+					  Math.max(marker.stats.followers, marker.stats.following)
+					? "mutual"
+					: marker.stats.following > marker.stats.followers
+						? "following"
+						: "followers";
 		return {
-			feature,
+			key: index,
+			count,
+			color: relationshipColor(relationship),
 			x: ((lng + 180) / 360) * 1000,
 			y: ((90 - lat) / 180) * 500,
 		};
@@ -427,21 +398,17 @@ function SvgMapFallback({ data }: { data: NetworkMapResponse }) {
 					strokeWidth="36"
 					strokeLinecap="round"
 				/>
-				{points.map(({ feature, x, y }) => (
+				{points.map(({ key, count, color, x, y }) => (
 					<circle
-						key={feature.properties.profileId}
+						key={key}
 						cx={x}
 						cy={y}
-						r={feature.properties.relationship === "mutual" ? 4.5 : 3.5}
-						fill={
-							feature.properties.relationship === "mutual"
-								? "#22c55e"
-								: feature.properties.relationship === "following"
-									? "#f59e0b"
-									: "#1d9bf0"
-						}
+						r={Math.min(16, 3.5 + Math.log2(count))}
+						fill={color}
 						opacity="0.86"
-					/>
+					>
+						<title>{formatNumber(count)} profiles</title>
+					</circle>
 				))}
 			</svg>
 		</div>
@@ -451,7 +418,7 @@ function SvgMapFallback({ data }: { data: NetworkMapResponse }) {
 function ProfilePopup({ feature }: { feature: MapFeature }) {
 	return (
 		<div className="flex max-w-[280px] gap-3 text-[13px] text-[#0f1419]">
-			<Avatar feature={feature} size={48} className="ring-[#d9e2ea]" />
+			<MapAvatar feature={feature} size={48} className="ring-[#d9e2ea]" />
 			<div className="min-w-0">
 				<div className="truncate font-bold">{feature.properties.name}</div>
 				<div className="truncate text-[#536471]">
@@ -495,7 +462,7 @@ function ClusterPopup({
 			</div>
 			<div className="mt-3 flex -space-x-2">
 				{features.slice(0, 6).map((feature) => (
-					<Avatar
+					<MapAvatar
 						key={feature.properties.profileId}
 						feature={feature}
 						size={36}
@@ -509,7 +476,7 @@ function ClusterPopup({
 						key={feature.properties.profileId}
 						className="flex min-w-0 items-center gap-2 py-2"
 					>
-						<Avatar feature={feature} size={28} className="ring-[#ffffff]" />
+						<MapAvatar feature={feature} size={28} className="ring-[#ffffff]" />
 						<div className="min-w-0 flex-1">
 							<div className="truncate font-semibold">
 								{feature.properties.name}
@@ -534,12 +501,17 @@ function ClusterPopup({
 }
 
 function ProfileRow({ feature }: { feature: MapFeature }) {
+	const { readOnly } = useDeploymentMode();
 	return (
 		<a
 			className="flex min-w-0 gap-3 border-b border-[var(--line)] px-4 py-3 transition-colors hover:bg-[var(--bg-hover)]"
-			href={`/profiles/${encodeURIComponent(feature.properties.handle)}`}
+			href={
+				readOnly
+					? undefined
+					: `/profiles/${encodeURIComponent(feature.properties.handle)}`
+			}
 		>
-			<Avatar feature={feature} size={40} className="ring-[var(--bg)]" />
+			<MapAvatar feature={feature} size={40} className="ring-[var(--bg)]" />
 			<div className="min-w-0 flex-1">
 				<div className="flex min-w-0 items-center gap-1.5">
 					<span className="truncate font-bold text-[var(--ink)]">
@@ -571,14 +543,28 @@ function VisibleProfilesPanel({
 	search,
 	onSearchChange,
 	totalVisible,
+	matchingProfiles,
+	offset,
+	pageSize,
+	onOffsetChange,
+	updating,
 	zoom,
 }: {
 	features: MapFeature[];
 	search: string;
 	onSearchChange: (value: string) => void;
 	totalVisible: number;
+	matchingProfiles: number;
+	offset: number;
+	pageSize: number;
+	onOffsetChange: (offset: number) => void;
+	updating: boolean;
 	zoom: number;
 }) {
+	const listRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (listRef.current) listRef.current.scrollTop = 0;
+	}, [features]);
 	return (
 		<aside className="flex min-h-[420px] min-w-0 flex-col border-t border-[var(--line)] bg-[var(--bg)] min-[1180px]:h-full min-[1180px]:border-t-0 min-[1180px]:border-l">
 			<header className="sticky top-0 z-10 border-b border-[var(--line)] bg-[color:color-mix(in_srgb,var(--bg)_88%,transparent)] px-4 py-3 backdrop-blur">
@@ -593,7 +579,7 @@ function VisibleProfilesPanel({
 						</p>
 					</div>
 					<div className="rounded-full border border-[var(--line)] px-2 py-1 text-[12px] font-semibold text-[var(--ink-soft)]">
-						{formatNumber(features.length)}
+						{formatNumber(matchingProfiles)}
 					</div>
 				</div>
 				<label className={cx(searchFieldShellClass, "mt-3 h-10")}>
@@ -606,7 +592,11 @@ function VisibleProfilesPanel({
 					/>
 				</label>
 			</header>
-			<div className="min-h-0 flex-1 overflow-y-auto">
+			<div
+				ref={listRef}
+				aria-busy={updating}
+				className="min-h-0 flex-1 overflow-y-auto"
+			>
 				{features.length > 0 ? (
 					features.map((feature) => (
 						<ProfileRow key={feature.properties.profileId} feature={feature} />
@@ -619,6 +609,30 @@ function VisibleProfilesPanel({
 					</div>
 				)}
 			</div>
+			{matchingProfiles > pageSize ? (
+				<div className="flex items-center justify-between gap-2 border-t border-[var(--line)] px-4 py-3">
+					<button
+						className={secondaryButtonClass}
+						type="button"
+						disabled={updating || offset === 0}
+						onClick={() => onOffsetChange(Math.max(0, offset - pageSize))}
+					>
+						Previous
+					</button>
+					<span className="text-[12px] text-[var(--ink-soft)]">
+						{formatNumber(Math.floor(offset / pageSize) + 1)} /{" "}
+						{formatNumber(Math.ceil(matchingProfiles / pageSize))}
+					</span>
+					<button
+						className={secondaryButtonClass}
+						type="button"
+						disabled={updating || offset + pageSize >= matchingProfiles}
+						onClick={() => onOffsetChange(offset + pageSize)}
+					>
+						Next
+					</button>
+				</div>
+			) : null}
 		</aside>
 	);
 }
@@ -643,14 +657,11 @@ export function NetworkMapRouteView({
 	searchState?: NetworkMapRouteSearch;
 	onSearchChange?: RouteSearchChange<NetworkMapRouteSearch>;
 } = {}) {
-	const [localSearch, setLocalSearch] = useState(() =>
-		validateNetworkMapSearch({}),
+	const { searchState, updateSearch } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateNetworkMapSearch,
 	);
-	const searchState = controlledSearch ?? localSearch;
-	const updateSearch: RouteSearchChange<NetworkMapRouteSearch> = (
-		next,
-		options,
-	) => (onSearchChange ? onSearchChange(next, options) : setLocalSearch(next));
 	const {
 		type,
 		setType,
@@ -662,8 +673,8 @@ export function NetworkMapRouteView({
 		loading,
 		error,
 		refresh,
-		visibleFeatures,
-		filteredVisibleFeatures,
+		updating,
+		setOffset,
 		mapTypes,
 	} = useNetworkMapController(searchState, updateSearch);
 
@@ -750,10 +761,15 @@ export function NetworkMapRouteView({
 						<MapboxPanel data={data} onViewportChange={setViewport} />
 					</div>
 					<VisibleProfilesPanel
-						features={filteredVisibleFeatures}
+						features={data.features}
 						onSearchChange={setVisibleSearch}
 						search={visibleSearch}
-						totalVisible={visibleFeatures.length}
+						totalVisible={data.visibleProfiles}
+						matchingProfiles={data.matchingProfiles}
+						offset={data.offset}
+						pageSize={data.pageSize}
+						onOffsetChange={setOffset}
+						updating={updating}
 						zoom={viewport.zoom}
 					/>
 				</div>

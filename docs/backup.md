@@ -97,6 +97,14 @@ Git operations are rooted at the configured `repoPath`. If that directory sits i
 
 This is what makes birdclaw safe across multiple machines: each machine can sync independently, and the merge step preserves rows that only one side has.
 
+### Note Tweet compatibility
+
+Note Tweets keep their complete text and matching entities in the existing schema-8 tweet fields. New exports add an optional `note_tweet_json` field so current readers can preserve the full body when a later live payload contains only a preview. The backup schema stays at 8: existing readers can still validate and import these backups.
+
+Older writers omit that optional marker when re-exporting. They retain the full text and entities, but do not provide the new protection against preview-only live updates or the expandable Note Tweet presentation. Use current Birdclaw versions on machines that refresh Note Tweets.
+
+The local SQLite database migrates to version 14 on writable startup. Prepare read-only archive deployments with a writable initialization before serving the updated application. Stop older writer processes before upgrading; all writers must use the current incremental search-index implementation. Map revision counters are derived locally and do not change the portable backup schema, which remains at 8.
+
 ## `backup import`
 
 ```bash

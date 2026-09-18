@@ -1,10 +1,116 @@
 # CHANGELOG
 
-## 0.12.4 - Unreleased
+## 0.14.1 - Unreleased
 
-### Fixes
+- Dismiss open conversations when tapping plain feed text on touchscreens; preserve desktop click-to-open, explicit Thread controls, links, and text selection. (#225 — thanks @sahil7886)
+- Preserve UTF-8 text across archive extraction chunks and reject truncated data arrays before merge or restore can change stored rows.
 
-- Make plain-text taps on timeline rows dismiss-only on touch devices: tapping unlinked tweet text closes any open conversation surface in the feed (including one opened from another row) and never opens a thread; the Thread button remains the explicit opener.
+## 0.14.0 - 2026-09-14
+
+**Highlights:** Play videos and GIFs directly in the feed, explore faster follower maps, share archived conversations with permalinks, and run live workflows without Bird.
+
+- Play tweet videos and GIF clips directly in the feed with posters and native controls, choose playable video variants, and make link previews compact with readable metadata and no repeated URLs or empty image panels.
+- Load large follower maps through cached server-side clustering and paginated viewport reads, preserving full-network search and counts while avoiding full-profile downloads and geocoding delays during navigation.
+- Add shareable `/tweets/<id>` permalinks that open saved conversations, highlight and focus the selected reply, and work in read-only archives with clear missing-post and limited-context states.
+- Make bird optional across live workflows: verify xurl moderation directly, add native cookie-backed DM requests and accept/reject/block actions, preserve DM account selection and invalidate all transport caches, and provide xurl defaults/fallbacks for sync and profile enrichment.
+- Keep Bird optional in scheduled account sync, enable manual and automatic web DM sync for secondary accounts, and reject malformed native DM page containers instead of reporting empty success.
+- Speed up account feeds, saved posts, Inbox, and archive navigation with bounded page selection and shared read-only response caches; preserve sparse matches and rolling date windows, and add a full-page performance audit.
+- Speed up map pagination, search, and panning by reusing bounded viewport and cluster-preview caches, normalizing search text once per profile, and avoiding repeated coordinate calculations; add a reproducible map CPU benchmark.
+- Build read-only maps from compact rows, sort only located groups, and batch visible profile metadata within one SQLite snapshot; accelerate Following and Mutual maps with directional index lookups while preserving full-network search, counts, and GeoJSON output.
+- Speed up uncached Videos queries by rejecting unrelated URLs before exact host checks, and reduce map construction work by grouping locations in one pass while preserving point order and counts.
+- Make search updates incremental through indexed document lookups, skip unchanged text in small updates, and share final-content indexing across sync, replies, imports, and backup merges; reuse rolling Links results until a time boundary or database change alters their inputs.
+- Speed up large DM syncs with one batched search-index deletion, avoid sorting timestamp ties during tweet selection, and cover current network-map membership with a partial SQLite index; add a reproducible SQLite read/write audit.
+- Compile shared API response and report-event validators once with Zod 4.6.5 to speed repeated feed, DM, and map validation while preserving defaults, media normalization, and detailed errors.
+- Keep read-only maps cached through unrelated sync commits, refresh display metadata without rebuilding clusters, honor geocode-suppression expiry, and use a spatial grid for faster panning; schema 14 adds transactional map revision counters and requires writable initialization before read-only serving.
+- Reject empty map benchmark paths before they can fall back to the default archive.
+- Update TanStack Router to 1.170.36, TanStack Start to 1.168.53, Zod to 4.6.4, and compatible transitive dependencies.
+
+## 0.13.0 - 2026-09-13
+
+### Highlights
+
+- **Keep the full post.** Preserve long-form X Note Tweets across sync, search, and backups, and expand them directly in the timeline.
+- **Jump from the archive to X.** Open posts, quoted tweets, and conversations on X from their archive cards, including in read-only deployments.
+- **Read saved records from the CLI.** Look up individual tweets, threads, and DM conversations in the selected account, with JSON output for scripts.
+- **Spend less time waiting.** Start the CLI faster and reduce repeated profile and history work during sync and identity searches.
+
+### Upgrade notes
+
+- Note Tweet storage adds SQLite migration 11. Prepare existing read-only archive snapshots with writable initialization before serving the updated application.
+- Backups remain interoperable with schema-8 readers and writers. Older writers retain full Note Tweet text but omit the optional Note Tweet marker. (#134)
+
+### Fixes and improvements
+
+- Preserve full Note Tweet text and entities through live ingestion, search, archive and backup merges, and expandable timeline rendering. (#134 — thanks @eferm)
+- Add **Open on X** links to feed cards, parent and quoted tweets, and expanded conversations. Reposts open the original tweet when its ID is known. (#189)
+- Show “no threads” in feed cards when no other archived replies are found, instead of opening an empty conversation panel. (#207)
+- Add account-scoped `show tweet`, `show thread`, and `show dm` commands with JSON output, plus `db vacuum` to reclaim unused SQLite space. (#192)
+- Honor `--json` for parser and uncaught runtime failures and server startup, expose global options in nested help, and validate the server port before startup. (#190)
+- Validate numeric CLI options before account lookups or command work, preventing negative limits from requesting unlimited DM results and rejecting invalid score thresholds. (#192)
+
+### Performance
+
+- Reduce CLI startup time by bundling the used Effect modules while keeping other direct dependencies external. (#193)
+- Reconcile each tweet author once per ingested payload, avoiding repeated profile and history work for posts and included references by the same author. (#200)
+- Bound profile-history reads in SQLite, omit unused raw payloads, and index historical follower membership, follow events, and list owners by profile to avoid repeated full-table scans. (#194, #195)
+
+### Developer tools and maintenance
+
+- Add opt-in numeric CLI timing summaries for elapsed time, process CPU, and database work without exposing queries or archive contents. (#191)
+- Consolidate backup merge declarations, API data types, transport pagination, CLI streams, and input-error handling while preserving command output and archive compatibility. (#196, #202, #203)
+- Give digest, discussion, and profile analysis one lifecycle for request construction, persistence, cache replay, and completion events; retain refresh, citation, and streaming behavior. (#206)
+- Share parsing of profile URL entities and identity index insertion rules, and consolidate automatic backup setup and result handling while retaining freshness checks and sync behavior. (#204)
+- Stabilize backup integration tests under slow filesystem I/O with focused fixtures and independent invalid-path cases, retaining real durability and publication checks. Exercise local JSON commands and failures through installed Node and Bun packages. (#190, #205)
+- Update Hono to 4.13.7 and the development/CI Node pin to 26.8.2; installed-package checks retain the Node 26.5.1 minimum. (#201)
+
+## 0.12.6 - 2026-09-12
+
+### Highlights
+
+- **Fresh mentions, even during a backfill.** Refresh the newest mentions without abandoning older pages, with native commands for checking the latest activity and resuming history.
+- **A faster everyday archive.** Feeds, Inbox, search, maps, and long DM conversations do less unnecessary work, while the browser and CLI start with fewer dependencies.
+- **More reliable images.** Avatars and link-preview thumbnails recover when local cached images are missing, including in read-only archives and network maps.
+
+### Fixes and improvements
+
+- Add `sync mentions --latest` and `--resume`. Newest-page reads preserve pending continuations, resumed scans retain their original boundaries, and JSON output reports the scan intent, position, and check time. Web and scheduled account refreshes now request current mentions. (#186)
+- Restore avatar fallbacks throughout profiles and maps, and include original-author profiles when syncing reposts and quoted tweets. (#146, #150, #152)
+- Restore external link-preview thumbnails through a bounded image cache, and cancel obsolete preview work so navigation does not leave new cards waiting behind abandoned requests. (#145, #153)
+- Keep hover previews correctly positioned and unclipped when their layout or content changes. (#167)
+- Preserve deterministic timeline ordering at page boundaries while selecting posts before loading their rich metadata. (#183)
+
+### Performance
+
+- Page long DM histories and cache the selected conversation independently of list filters. Earlier messages remain accessible, and complete CLI/API reads keep their existing behavior. Reuse sender profiles and avoid rerendering unchanged conversations while composing. (#182)
+- Speed up feeds, Inbox, and search by selecting and ranking narrow candidate rows before loading full content. Batch cited tweets, reposts, mention profiles, links, and conversation enrichment instead of repeating lookups per item.
+- Reduce startup requests and browser JavaScript, bootstrap authorized read-only status with the page, reuse validated read-only queries until the database changes, and serve compact versioned branding assets.
+- Make map interactions smoother by reusing profile ordering while panning and zooming. Reuse formatters, pause timestamp updates in hidden tabs, and skip unchanged timeline renders.
+- Speed up large archive imports and live sync by rebuilding tweet and DM search entries in batches instead of repeatedly scanning the full index. (#184, #185)
+- Reduce SQLite allocation and preparation work and reuse a bounded statement cache.
+- Start CLI help and local commands with fewer imports; standalone version checks return directly from package metadata.
+
+## 0.12.5 - 2026-09-12
+
+### Highlights
+
+- Serve a prepared Birdclaw archive in an explicit, opt-in read-only deployment mode.
+
+### Changes
+
+- Add `BIRDCLAW_DEPLOYMENT_READ_ONLY=1` for cached archive deployments, using strict database readers and suppressing automatic backup synchronization and cache population.
+- Reject mutating HTTP operations, live-generation routes, and transport subprocesses while retaining cached archive and authenticated MCP reads.
+- Hide unavailable navigation, reply composers, and sync controls in read-only mode, including automatic sync timers, while preserving normal interactive behavior and recovery pages.
+
+## 0.12.4 - 2026-09-11
+
+### Highlights
+
+- Choose the home-timeline transport used by digests through a deployment-wide environment default.
+
+### Changes
+
+- Add `BIRDCLAW_DIGEST_LIVE_MODE` for `today`, `digest`, and the digest API, preserve explicit overrides and the existing Xurl default, and report the selected home-timeline mode accurately. (#143 — thanks @sahil7886)
+- Refresh React, TanStack Router and Start, Effect, Zod, Lucide icons, Vite, and lint/type tooling while retaining the pinned Bun canary and Node 26 compatibility floor.
 
 ## 0.12.3 - 2026-09-07
 

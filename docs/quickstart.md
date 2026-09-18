@@ -93,6 +93,17 @@ Open <http://localhost:3000>. The default lanes:
 - **Inbox** — let heuristics or OpenAI float likely-important items
 - **Blocks** — maintain a local-first account-scoped blocklist
 
+Click a feed card with a mouse or use its **Thread** action to read the archived conversation. On touchscreens, **Thread** opens the conversation; tapping plain text on any feed card dismisses the open thread without opening another. Links and text selection keep their normal behavior. If the lookup finds no other posts, the card shows **no threads** instead of an empty panel.
+
+Use **Permalink** on a post, quoted post, or individual reply to open
+`/tweets/<tweet-id>`. This URL loads the saved conversation directly and scrolls
+to the highlighted post, including after reload or when opened in a new tab.
+**Copy link** copies its full URL for sharing. Standalone posts work too; missing
+or deleted posts show a clear not-found message. Conversation context remains
+bounded to cached posts, and the page indicates when some context is omitted.
+Permalinks work in read-only archives and retain the archive's existing access
+controls. They never initiate a live X lookup.
+
 Use the Sync button in Home, Mentions, Likes, Bookmarks, or DMs when you want fresh live data. Browser reloads only reread local SQLite; explicit sync avoids surprise live reads and rate-limit spend. Home and Mentions can optionally auto-sync per account at 5m, 10m, 15m, 30m, or 1h intervals. The setting stays in this browser, skips hidden-page runs, prevents overlap, and backs off after failures. Use [`birdclaw jobs`](jobs.md) instead when refresh must continue after the page closes.
 
 ## 6. Run real CLI workflows

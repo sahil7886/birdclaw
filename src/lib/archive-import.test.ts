@@ -20,6 +20,7 @@ import {
 } from "../test/test-home";
 import { __test__, importArchive, importArchiveEffect } from "./archive-import";
 import { getBirdclawPaths } from "./config";
+import { refreshSearchRows } from "./search-index";
 import { getNativeDb } from "./db";
 import { listFollowEvents, listUnfollowedSince } from "./follow-graph";
 import { getConversationThread, listDmConversations } from "./dm-read-model";
@@ -722,6 +723,37 @@ function makeMediaVariantsArchive() {
 }
 
 describe("archive import", () => {
+	it.each([false, true])(
+		"preserves stored tweets when an archive array is truncated (restore=%s)",
+		async (restore) => {
+			await importArchive(makeArchive(), { select: ["tweets"] });
+			const db = getNativeDb({ seedDemoData: false });
+			const before = db.prepare("select * from tweets order by id").all();
+			const searchBefore = db
+				.prepare("select * from tweets_fts order by rowid")
+				.all();
+			const archivePath = makeArchive();
+			const root = path.dirname(archivePath);
+			writeFileSync(
+				path.join(root, "sample/data/tweets.js"),
+				'window.YTD.tweets.part0 = [{"tweet":{"id_str":"999","full_text":"incomplete replacement"}}',
+			);
+			execFileSync("zip", ["-q", archivePath, "sample/data/tweets.js"], {
+				cwd: root,
+			});
+
+			await expect(
+				importArchive(archivePath, { select: ["tweets"], restore }),
+			).rejects.toThrow("Unterminated archive JSON array");
+			expect(db.prepare("select * from tweets order by id").all()).toEqual(
+				before,
+			);
+			expect(
+				db.prepare("select * from tweets_fts order by rowid").all(),
+			).toEqual(searchBefore);
+		},
+	);
+
 	it("retains explicit tweet tombstones without inferring deletion from absence", async () => {
 		const initialArchive = makeTweetRetentionArchive();
 		await importArchive(initialArchive, { restore: true });
@@ -742,8 +774,8 @@ describe("archive import", () => {
 				'2025-06-03T19:30:20.000Z', 1, 'archive', '{}',
 				'2025-06-03T19:30:20.000Z'
 			);
-			insert into tweets_fts (tweet_id, text) values ('edit-1', 'original body');
 		`);
+		refreshSearchRows(db, "tweet", ["edit-1"]);
 		await importArchive(initialArchive);
 		expect(
 			db
@@ -1043,8 +1075,8 @@ describe("archive import", () => {
 			text: "keep other dm",
 			direction: "incoming",
 		});
+		refreshSearchRows(db, "dm", ["m-other"]);
 		db.exec(`
-			insert into dm_fts (message_id, text) values ('m-other', 'keep other dm');
 			insert into tweet_account_edges (
 				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
 				source, raw_json, updated_at
@@ -1259,6 +1291,50 @@ describe("archive import", () => {
 			db.prepare("select id from tweets where id in ('5', '6')").all(),
 		).toEqual([{ id: "5" }]);
 	}, 30000);
+
+	it("preserves Note Tweet content during archive merges", async () => {
+		const archivePath = makeArchive();
+		const db = getNativeDb();
+		const noteEntities = {
+			hashtags: [{ tag: "longform", start: 33, end: 42 }],
+		};
+		const noteText = "full live Note Tweet archiveguardneedle #longform";
+		insertTestProfile(db);
+		insertTestTweet(db, {
+			id: "100",
+			text: noteText,
+			entitiesJson: JSON.stringify(noteEntities),
+		});
+		db.prepare("update tweets set note_tweet_json = ? where id = '100'").run(
+			JSON.stringify({ text: noteText, entities: noteEntities }),
+		);
+		refreshSearchRows(db, "tweet", ["100"]);
+
+		await importArchive(archivePath, { select: ["tweets"] });
+
+		const row = db
+			.prepare(
+				"select text, entities_json, note_tweet_json from tweets where id = '100'",
+			)
+			.get() as {
+			text: string;
+			entities_json: string;
+			note_tweet_json: string;
+		};
+		expect(row.text).toBe(noteText);
+		expect(JSON.parse(row.entities_json)).toEqual(noteEntities);
+		expect(JSON.parse(row.note_tweet_json)).toEqual({
+			text: noteText,
+			entities: noteEntities,
+		});
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweets_fts match 'archiveguardneedle'",
+				)
+				.get(),
+		).toEqual({ count: 1 });
+	});
 
 	it("extracts archive media files into media originals", async () => {
 		const archivePath = makeMediaArchive();
@@ -1831,13 +1907,13 @@ describe("archive import", () => {
 			text: "keep other dm",
 			direction: "incoming",
 		});
+		refreshSearchRows(db, "dm", ["m-other"]);
 		db.exec(`
 	      insert into link_occurrences (
 	        source_kind, source_id, source_position, short_url, account_id, conversation_id, created_at
 	      ) values (
 	        'dm', 'm-stale', 0, 'https://t.co/stale-dm', 'acct_primary', 'dm-stale', '2026-01-01T00:00:00.000Z'
 	      );
-	      insert into dm_fts (message_id, text) values ('m-other', 'keep other dm');
 	      insert into link_occurrences (
 	        source_kind, source_id, source_position, short_url, account_id, conversation_id, created_at
 	      ) values (
@@ -1995,8 +2071,8 @@ describe("archive import", () => {
         'acct_primary', '5', 'home', '2025-01-01T00:00:00.000Z',
         '2025-01-01T00:00:00.000Z', 1, 'xurl', '{}', '2025-01-01T00:00:00.000Z'
       );
-      insert into tweets_fts (tweet_id, text) values ('5', 'full live root text');
     `);
+		refreshSearchRows(db, "tweet", ["5"]);
 
 		await importArchive(archivePath, { select: ["likes"] });
 		const tweet = db

@@ -112,7 +112,7 @@ export const feedActionIconWrapClass =
 export const feedActionIconClass = "size-[18px]";
 
 export const feedRowTextClass =
-	"whitespace-pre-wrap break-words text-[15px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere] [-webkit-touch-callout:none] [&_a]:[-webkit-touch-callout:none] [&_a]:[touch-action:manipulation]";
+	"whitespace-pre-wrap break-words text-[15px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere]";
 
 export const feedRowStatePillClass =
 	"inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg-active)] px-2 py-0.5 text-[12px] font-semibold text-[var(--ink-soft)]";
@@ -187,6 +187,9 @@ export const avatarChipClass =
 export const avatarChipLargeClass = "avatar-chip-large size-16 text-[18px]";
 
 export const avatarChipSmallClass = "avatar-chip-small size-8 text-[12px]";
+
+export const avatarChipMapClass =
+	"relative grid shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--accent-soft)] text-[12px] font-bold text-[var(--accent)] ring-2 ring-white";
 
 /* Embedded tweet / link preview (rounded box, used inside feed row body). */
 export const embeddedCardClass =

@@ -1,6 +1,7 @@
+import { CliInputError } from "./numeric-options";
 import type { CliCommandContext } from "./command-context";
+import { defaultDigestLiveSyncMode } from "#/lib/digest-live-mode";
 import {
-	defaultDigestLiveSyncMode,
 	normalizeDigestLanguage,
 	streamPeriodDigest,
 	type PeriodDigestOptions,
@@ -24,14 +25,32 @@ export function registerAnalysisCommands({
 	parseNonNegativeIntegerOption,
 	parsePositiveIntegerOption,
 }: CliCommandContext) {
-	function printError(error: string) {
-		console.error(JSON.stringify({ error }));
+	function printAnalysisStream<Result extends { markdown: string }>(
+		run: (
+			onDelta: ((delta: string) => void) | undefined,
+			asJson: boolean,
+		) => Promise<Result>,
+	) {
+		const asJson = Boolean(program.opts().json);
+		return run(
+			asJson
+				? undefined
+				: (delta) => {
+						process.stdout.write(delta);
+					},
+			asJson,
+		).then((result) => {
+			if (asJson) print(result, true);
+			else if (!result.markdown.endsWith("\n")) process.stdout.write("\n");
+		});
 	}
 
 	function parseDigestLiveModeOption(
 		value: string | undefined,
 	): PeriodDigestOptions["liveSyncMode"] {
-		const normalized = (value ?? defaultDigestLiveSyncMode()).trim().toLowerCase();
+		const normalized = (value ?? defaultDigestLiveSyncMode())
+			.trim()
+			.toLowerCase();
 		if (
 			normalized === "auto" ||
 			normalized === "bird" ||
@@ -39,9 +58,7 @@ export function registerAnalysisCommands({
 		) {
 			return normalized;
 		}
-		printError("--live-mode must be auto, bird, or xurl");
-		process.exitCode = 1;
-		return undefined;
+		throw new CliInputError("--live-mode must be auto, bird, or xurl");
 	}
 	function parseDigestPeriod(value: string | undefined): PeriodDigestPreset {
 		const normalized = value?.trim().toLowerCase();
@@ -66,32 +83,26 @@ export function registerAnalysisCommands({
 			liveSync?: boolean;
 			liveMode?: string;
 		},
-	): PeriodDigestOptions | null {
+	): PeriodDigestOptions {
 		const maxTweets = parseNonNegativeIntegerOption(
 			options.maxTweets,
 			"--max-tweets",
 		);
-		if (options.maxTweets !== undefined && maxTweets === undefined) {
-			return null;
-		}
+
 		const maxLinks = parseNonNegativeIntegerOption(
 			options.maxLinks,
 			"--max-links",
 		);
-		if (options.maxLinks !== undefined && maxLinks === undefined) {
-			return null;
-		}
+
 		const liveSyncMode = parseDigestLiveModeOption(options.liveMode);
-		if (liveSyncMode === undefined) {
-			return null;
-		}
+
 		let language: string | undefined;
 		try {
 			language = normalizeDigestLanguage(options.language);
 		} catch (error) {
-			printError(error instanceof Error ? error.message : String(error));
-			process.exitCode = 1;
-			return null;
+			throw new CliInputError(
+				error instanceof Error ? error.message : String(error),
+			);
 		}
 		return {
 			period: parseDigestPeriod(period),
@@ -110,27 +121,14 @@ export function registerAnalysisCommands({
 	}
 
 	function runDigestCli(options: PeriodDigestOptions) {
-		const asJson = Boolean(program.opts().json);
-		return streamPeriodDigest(options, {
-			onDelta: asJson
-				? undefined
-				: (delta) => {
-						process.stdout.write(delta);
-					},
-		}).then((result) => {
-			if (asJson) {
-				print(result, true);
-				return;
-			}
-			if (!result.markdown.endsWith("\n")) {
-				process.stdout.write("\n");
-			}
-		});
+		return printAnalysisStream((onDelta) =>
+			streamPeriodDigest(options, { onDelta }),
+		);
 	}
 
 	function parseSearchDiscussionSource(
 		value: string | undefined,
-	): SearchDiscussionSource | undefined {
+	): SearchDiscussionSource {
 		const normalized = (value ?? "all").trim().toLowerCase();
 		if (
 			normalized === "all" ||
@@ -143,11 +141,9 @@ export function registerAnalysisCommands({
 		) {
 			return normalized;
 		}
-		printError(
+		throw new CliInputError(
 			"--source must be all, search, home, mentions, authored, likes, or bookmarks",
 		);
-		process.exitCode = 1;
-		return undefined;
 	}
 
 	function parseTweetSearchMode(value: string | undefined) {
@@ -160,9 +156,7 @@ export function registerAnalysisCommands({
 		) {
 			return normalized;
 		}
-		printError("--mode must be auto, bird, xurl, or local");
-		process.exitCode = 1;
-		return undefined;
+		throw new CliInputError("--mode must be auto, bird, xurl, or local");
 	}
 
 	function buildSearchDiscussionOptions(
@@ -182,22 +176,18 @@ export function registerAnalysisCommands({
 			limit?: string;
 			maxPages?: string;
 		},
-	): SearchDiscussionOptions | null {
+	): SearchDiscussionOptions {
 		const source = parseSearchDiscussionSource(options.source);
-		if (!source) return null;
+
 		const mode = parseTweetSearchMode(options.mode);
-		if (!mode) return null;
+
 		const limit = parsePositiveIntegerOption(options.limit, "--limit");
-		if (options.limit !== undefined && limit === undefined) {
-			return null;
-		}
+
 		const maxPages = parsePositiveIntegerOption(
 			options.maxPages,
 			"--max-pages",
 		);
-		if (options.maxPages !== undefined && maxPages === undefined) {
-			return null;
-		}
+
 		return {
 			query,
 			account: options.account,
@@ -217,22 +207,9 @@ export function registerAnalysisCommands({
 	}
 
 	function runSearchDiscussionCli(options: SearchDiscussionOptions) {
-		const asJson = Boolean(program.opts().json);
-		return streamSearchDiscussion(options, {
-			onDelta: asJson
-				? undefined
-				: (delta) => {
-						process.stdout.write(delta);
-					},
-		}).then((result) => {
-			if (asJson) {
-				print(result, true);
-				return;
-			}
-			if (!result.markdown.endsWith("\n")) {
-				process.stdout.write("\n");
-			}
-		});
+		return printAnalysisStream((onDelta) =>
+			streamSearchDiscussion(options, { onDelta }),
+		);
 	}
 
 	function buildProfileAnalysisOptions(
@@ -249,71 +226,42 @@ export function registerAnalysisCommands({
 			rateLimitRetryMs?: string;
 			rateLimitRetries?: string;
 		},
-	): ProfileAnalysisOptions | null {
+	): ProfileAnalysisOptions {
 		const maxTweets = parsePositiveIntegerOption(
 			options.maxTweets,
 			"--max-tweets",
 		);
-		if (options.maxTweets !== undefined && maxTweets === undefined) {
-			return null;
-		}
+
 		const maxPages = parsePositiveIntegerOption(
 			options.maxPages,
 			"--max-pages",
 		);
-		if (options.maxPages !== undefined && maxPages === undefined) {
-			return null;
-		}
+
 		const maxConversations = parsePositiveIntegerOption(
 			options.maxConversations,
 			"--max-conversations",
 		);
-		if (
-			options.maxConversations !== undefined &&
-			maxConversations === undefined
-		) {
-			return null;
-		}
+
 		const maxConversationPages = parsePositiveIntegerOption(
 			options.maxConversationPages,
 			"--max-conversation-pages",
 		);
-		if (
-			options.maxConversationPages !== undefined &&
-			maxConversationPages === undefined
-		) {
-			return null;
-		}
+
 		const conversationDelayMs = parseNonNegativeIntegerOption(
 			options.conversationDelayMs,
 			"--conversation-delay-ms",
 		);
-		if (
-			options.conversationDelayMs !== undefined &&
-			conversationDelayMs === undefined
-		) {
-			return null;
-		}
+
 		const rateLimitRetryMs = parseNonNegativeIntegerOption(
 			options.rateLimitRetryMs,
 			"--rate-limit-retry-ms",
 		);
-		if (
-			options.rateLimitRetryMs !== undefined &&
-			rateLimitRetryMs === undefined
-		) {
-			return null;
-		}
+
 		const rateLimitMaxRetries = parseNonNegativeIntegerOption(
 			options.rateLimitRetries,
 			"--rate-limit-retries",
 		);
-		if (
-			options.rateLimitRetries !== undefined &&
-			rateLimitMaxRetries === undefined
-		) {
-			return null;
-		}
+
 		return {
 			handle,
 			account: options.account,
@@ -330,33 +278,21 @@ export function registerAnalysisCommands({
 	}
 
 	function runProfileAnalysisCli(options: ProfileAnalysisOptions) {
-		const asJson = Boolean(program.opts().json);
-		return streamProfileAnalysis(options, {
-			onDelta: asJson
-				? undefined
-				: (delta) => {
-						process.stdout.write(delta);
-					},
-			onEvent: asJson
-				? undefined
-				: (event) => {
-						if (event.type === "status") {
-							process.stderr.write(
-								event.detail
-									? `${event.label}: ${event.detail}\n`
-									: `${event.label}\n`,
-							);
-						}
-					},
-		}).then((result) => {
-			if (asJson) {
-				print(result, true);
-				return;
-			}
-			if (!result.markdown.endsWith("\n")) {
-				process.stdout.write("\n");
-			}
-		});
+		return printAnalysisStream((onDelta, asJson) =>
+			streamProfileAnalysis(options, {
+				onDelta,
+				onEvent: asJson
+					? undefined
+					: (event) => {
+							if (event.type === "status")
+								process.stderr.write(
+									event.detail
+										? `${event.label}: ${event.detail}\n`
+										: `${event.label}\n`,
+								);
+						},
+			}),
+		);
 	}
 	program
 		.command("research [query]")
@@ -406,7 +342,6 @@ export function registerAnalysisCommands({
 		.action(async (query, options) => {
 			await autoUpdateBeforeRead();
 			const discussionOptions = buildSearchDiscussionOptions(query, options);
-			if (!discussionOptions) return;
 			await runSearchDiscussionCli(discussionOptions);
 		});
 
@@ -441,7 +376,6 @@ export function registerAnalysisCommands({
 		.action(async (handle, options) => {
 			await autoUpdateBeforeRead();
 			const analysisOptions = buildProfileAnalysisOptions(handle, options);
-			if (!analysisOptions) return;
 			await runProfileAnalysisCli(analysisOptions);
 		});
 
@@ -467,7 +401,6 @@ export function registerAnalysisCommands({
 		.action(async (options) => {
 			await autoUpdateBeforeRead();
 			const digestOptions = buildDigestOptions("today", options);
-			if (!digestOptions) return;
 			await runDigestCli(digestOptions);
 		});
 
@@ -495,7 +428,6 @@ export function registerAnalysisCommands({
 		.action(async (period, options) => {
 			await autoUpdateBeforeRead();
 			const digestOptions = buildDigestOptions(period, options);
-			if (!digestOptions) return;
 			await runDigestCli(digestOptions);
 		});
 }

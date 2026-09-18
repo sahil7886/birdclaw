@@ -14,6 +14,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { smokeWithoutBird } from "./birdless-smoke.mjs";
+import { smokeNativeDms } from "./native-dm-smoke.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -89,7 +91,15 @@ async function waitForServer(child, label) {
 			const match = output.match(/http:\/\/127\.0\.0\.1:(\d+)/);
 			if (!match) return;
 			clearTimeout(timer);
-			resolve(`http://127.0.0.1:${match[1]}`);
+			try {
+				const startup = JSON.parse(output);
+				if (startup.ok !== true || startup.port !== Number(match[1])) {
+					throw new Error(`${label}: invalid JSON startup event`);
+				}
+				resolve(startup.url);
+			} catch (error) {
+				reject(error);
+			}
 		});
 		child.stderr.on("data", (chunk) => {
 			errors += String(chunk);
@@ -129,15 +139,19 @@ async function smokeRuntime({
 }) {
 	const home = path.join(tempRoot, `home-${runtime.name}`);
 	const env = {
-		...process.env,
+		...(process.platform === "win32"
+			? { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }
+			: { PATH: "/usr/bin:/bin" }),
+		HOME: home,
+		USERPROFILE: home,
+		BIRDCLAW_CONFIG: path.join(home, "config.json"),
+		BIRDCLAW_BIRD_COMMAND: path.join(home, "bird-does-not-exist"),
 		BIRDCLAW_BACKUP_AUTO_SYNC: "0",
 		BIRDCLAW_DISABLE_LIVE_PROFILE_LOOKUP: "1",
 		BIRDCLAW_DISABLE_LIVE_WRITES: "1",
 		BIRDCLAW_HOME: home,
 		DO_NOT_TRACK: "1",
 	};
-	delete env.BIRDCLAW_MCP_ACCOUNT;
-	delete env.BIRDCLAW_WEB_TOKEN;
 
 	const versionStarted = performance.now();
 	const { stdout: versionOutput } = await runRuntime(runtime, ["--version"], {
@@ -178,6 +192,53 @@ async function smokeRuntime({
 		{ cwd: installDir, env },
 	);
 	JSON.parse(statsOutput);
+	for (const args of [
+		["search", "tweets", "local-first", "--limit", "3", "--json"],
+		["search", "dms", "local", "--limit", "3", "--json"],
+		["dms", "list", "--limit", "3", "--json"],
+		["lists", "list", "--json"],
+		["graph", "summary", "--json"],
+		["blocks", "list", "--json"],
+		["mutes", "list", "--json"],
+		["inbox", "--limit", "3", "--json"],
+		["show", "tweet", "tweet_001", "--json"],
+		["show", "thread", "tweet_001", "--limit", "2", "--json"],
+		["show", "dm", "dm_001", "--json"],
+		["db", "vacuum", "--json"],
+	]) {
+		const { stdout } = await runRuntime(runtime, args, {
+			cwd: installDir,
+			env,
+		});
+		JSON.parse(stdout);
+	}
+	for (const [args, expectedCode] of [
+		[["unknown-command", "--json"], 2],
+		[["search", "tweets", "--unknown-option", "--json"], 2],
+		[["backup", "export", "--json"], 2],
+		[["show", "tweet", "--json"], 2],
+		[["--json"], 2],
+		[["dms", "list", "--limit", "-1", "--json"], 1],
+		[["show", "tweet", "tweet_001", "--account", "@birdclaw_lab", "--json"], 1],
+		[["backup", "import", path.join(tempRoot, "missing-backup"), "--json"], 1],
+	]) {
+		let failure;
+		try {
+			await runRuntime(runtime, args, { cwd: installDir, env });
+		} catch (error) {
+			failure = error;
+		}
+		if (
+			!failure ||
+			failure.code !== expectedCode ||
+			failure.stdout !== "" ||
+			typeof JSON.parse(failure.stderr).error !== "string"
+		) {
+			throw new Error(
+				`${runtime.name}: invalid CLI failure for ${args.join(" ")}`,
+			);
+		}
+	}
 
 	const port = await reserveLoopbackPort();
 	const expectedBaseUrl = `http://127.0.0.1:${String(port)}`;
@@ -189,7 +250,7 @@ async function smokeRuntime({
 	};
 	const child = spawnRuntime(
 		runtime,
-		["serve", "--host", "127.0.0.1", "--port", String(port)],
+		["serve", "--host", "127.0.0.1", "--port", String(port), "--json"],
 		{
 			cwd: installDir,
 			env: serverEnv,
@@ -216,6 +277,24 @@ async function smokeRuntime({
 				`${runtime.name}: static asset smoke failed with ${String(asset.status)}`,
 			);
 		}
+		const sourceResponse = await fetch(`${baseUrl}/api/data-sources`);
+		const sources = sourceResponse.ok ? await sourceResponse.json() : null;
+		if (
+			!sources?.sources.some(
+				(source) => source.source === "birdclaw" && source.works,
+			) ||
+			!sources.sources.some(
+				(source) => source.source === "bird" && !source.works,
+			) ||
+			!sources.capabilities.some(
+				(capability) =>
+					capability.key === "dms" &&
+					capability.notes.includes("bird is optional"),
+			)
+		)
+			throw new Error(
+				`${runtime.name}: data-source status failed without Bird`,
+			);
 
 		const transport = new StreamableHTTPClientTransport(
 			new URL(`${baseUrl}/mcp`),
@@ -288,6 +367,20 @@ async function smokeRuntime({
 		}
 	}
 	if (shutdownError) throw shutdownError;
+	const birdless = await smokeWithoutBird({
+		directory: path.join(tempRoot, `birdless-${runtime.name}`),
+		runCli: (args, env) => runRuntime(runtime, args, { cwd: installDir, env }),
+	});
+	const nativeDms = await smokeNativeDms({
+		directory: path.join(tempRoot, `native-dms-${runtime.name}`),
+		entry: runtime.prefix.at(-1),
+		runFixture: (launcher, args, env) =>
+			runRuntime(
+				{ ...runtime, prefix: [...runtime.prefix.slice(0, -1), launcher] },
+				args,
+				{ cwd: installDir, env },
+			),
+	});
 
 	return {
 		name: runtime.name,
@@ -295,6 +388,8 @@ async function smokeRuntime({
 		entry: runtime.prefix.at(-1),
 		versionMs: Math.round(versionMs),
 		installedRoot,
+		birdless,
+		nativeDms,
 	};
 }
 
@@ -304,6 +399,10 @@ try {
 		throw new Error(`Unexpected Bun revision: ${bunRevision}`);
 	}
 	const { stdout: nodeVersionOutput } = await run(nodeBin, ["--version"]);
+	const { stdout: nodeExecutablePath } = await run(nodeBin, [
+		"-p",
+		"process.execPath",
+	]);
 	const nodeVersion = nodeVersionOutput.trim();
 	const nodeMatch = nodeVersion.match(/^v26\.(\d+)\.(\d+)$/);
 	if (
@@ -443,7 +542,7 @@ try {
 		},
 		{
 			name: "node",
-			executable: nodeBin,
+			executable: nodeExecutablePath.trim(),
 			prefix: [launcher],
 		},
 	];

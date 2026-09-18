@@ -1,3 +1,20 @@
+import {
+	syncDirectory,
+	durableMkdir,
+	durableMkdtemp,
+	durableRename,
+	durableRemove,
+	durableCopyFile,
+	durableWriteFile,
+	probeBackupTransactionRoot,
+	assertOwnedPathStat,
+	validateRealTransactionDirectory,
+	validateTransactionTree,
+	resolveBackupFilePath,
+	assertBackupPathInsideRealRootEffect,
+	assertReadableBackupFileEffect,
+	assertNoSymlinkAncestorEffect,
+} from "./backup-filesystem";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createWriteStream, existsSync } from "node:fs";
@@ -5,7 +22,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { Data, Effect } from "effect";
+import { Data, Effect, Either } from "effect";
 import NativeSqliteDatabase, { type Database } from "./sqlite";
 import {
 	BACKUP_TABLE_CODECS,
@@ -19,10 +36,15 @@ import {
 	type BackupJsonRecord as JsonRecord,
 	type BackupJsonValue as JsonValue,
 } from "./backup-table-codecs";
-import { getBirdclawConfig, getBirdclawPaths } from "./config";
+import {
+	getBirdclawConfig,
+	getBirdclawPaths,
+	isReadOnlyDeployment,
+} from "./config";
 import { getNativeDb, refreshReadDatabasePoolAfterBulkWrite } from "./db";
 import { databaseWriteEffect } from "./database-writer";
 import {
+	toError,
 	runEffectBackground,
 	runEffectPromise,
 	trySync,
@@ -1023,171 +1045,6 @@ function getBackupTransactionRootEffect(repoPath: string) {
 			);
 		});
 	});
-}
-
-async function syncDirectory(directory: string) {
-	const handle = await fs.open(directory, "r");
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-}
-
-async function durableMkdir(directory: string) {
-	const missing: string[] = [];
-	let cursor = directory;
-	while (!existsSync(cursor)) {
-		missing.push(cursor);
-		const parent = path.dirname(cursor);
-		if (parent === cursor) break;
-		cursor = parent;
-	}
-	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	for (const created of missing.reverse()) {
-		await syncDirectory(created);
-		await syncDirectory(path.dirname(created));
-	}
-	if (missing.length === 0) await syncDirectory(directory);
-}
-
-async function durableMkdtemp(prefix: string) {
-	const directory = await fs.mkdtemp(prefix);
-	await syncDirectory(directory);
-	await syncDirectory(path.dirname(directory));
-	return directory;
-}
-
-async function durableRename(source: string, destination: string) {
-	await fs.rename(source, destination);
-	await syncDirectory(path.dirname(source));
-	if (path.dirname(destination) !== path.dirname(source)) {
-		await syncDirectory(path.dirname(destination));
-	}
-}
-
-async function durableRemove(
-	target: string,
-	options: { recursive?: boolean; force?: boolean } = {},
-) {
-	await fs.rm(target, options);
-	await syncDirectory(path.dirname(target));
-}
-
-async function durableCopyFile(source: string, destination: string) {
-	await fs.copyFile(source, destination);
-	const handle = await fs.open(destination, "r");
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await syncDirectory(path.dirname(destination));
-}
-
-async function durableWriteFile(
-	target: string,
-	content: string | Buffer,
-	encoding?: BufferEncoding,
-) {
-	const handle = await fs.open(target, "w", 0o600);
-	try {
-		await handle.writeFile(content, encoding ? { encoding } : undefined);
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await syncDirectory(path.dirname(target));
-}
-
-async function probeBackupTransactionRoot(root: string) {
-	const probePath = path.join(root, `.write-probe-${randomUUID()}`);
-	let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
-	try {
-		handle = await fs.open(probePath, "wx", 0o600);
-		await handle.writeFile(randomUUID(), "utf8");
-		await handle.sync();
-		await handle.close();
-		handle = undefined;
-		await fs.rm(probePath);
-		await syncDirectory(root);
-	} catch (error) {
-		await handle?.close().catch(() => undefined);
-		await fs.rm(probePath, { force: true }).catch(() => undefined);
-		await syncDirectory(root).catch(() => undefined);
-		throw error;
-	}
-}
-
-function assertOwnedPathStat(
-	stat: {
-		uid: number;
-		mode: number;
-		isDirectory(): boolean;
-		isFile(): boolean;
-		isSymbolicLink(): boolean;
-	},
-	label: string,
-	type: "directory" | "file",
-) {
-	if (
-		stat.isSymbolicLink() ||
-		(type === "directory" ? !stat.isDirectory() : !stat.isFile())
-	) {
-		throw new Error(`Unsafe backup transaction ${label}`);
-	}
-	const uid = process.getuid?.();
-	if (uid !== undefined && stat.uid !== uid) {
-		throw new Error(`Backup transaction ${label} is owned by another user`);
-	}
-	if ((stat.mode & 0o022) !== 0) {
-		throw new Error(`Backup transaction ${label} is group/world writable`);
-	}
-}
-
-async function validateRealTransactionDirectory(
-	directory: string,
-	label: string,
-	expectedDevice: number,
-) {
-	const resolved = path.resolve(directory);
-	const stat = await fs.lstat(resolved);
-	assertOwnedPathStat(stat, label, "directory");
-	if (
-		(await fs.realpath(resolved)) !== resolved ||
-		stat.dev !== expectedDevice
-	) {
-		throw new Error(
-			`Backup transaction ${label} is not a canonical local directory`,
-		);
-	}
-	return resolved;
-}
-
-async function validateTransactionTree(
-	root: string,
-	allowedRootEntries: ReadonlySet<string>,
-) {
-	const visit = async (directory: string, topLevel: boolean): Promise<void> => {
-		for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
-			if (topLevel && !allowedRootEntries.has(entry.name)) {
-				throw new Error(`Unexpected backup transaction entry: ${entry.name}`);
-			}
-			const target = path.join(directory, entry.name);
-			const stat = await fs.lstat(target);
-			if (stat.isSymbolicLink()) {
-				throw new Error("Backup transaction paths must not contain symlinks");
-			}
-			const uid = process.getuid?.();
-			if (uid !== undefined && stat.uid !== uid) {
-				throw new Error("Backup transaction path is owned by another user");
-			}
-			if (stat.isDirectory()) await visit(target, false);
-			else if (!stat.isFile())
-				throw new Error("Backup transaction path is not a regular file");
-		}
-	};
-	await visit(root, true);
 }
 
 function streamGitBlobToFileEffect({
@@ -3008,102 +2865,6 @@ function readManifestEffect(
 	});
 }
 
-function resolveBackupFilePath(repoPath: string, relativePath: string) {
-	if (path.isAbsolute(relativePath)) {
-		throw new Error(`Backup manifest path must be relative: ${relativePath}`);
-	}
-	const normalized = path.normalize(relativePath);
-	if (
-		normalized === "." ||
-		normalized.startsWith("..") ||
-		path.isAbsolute(normalized)
-	) {
-		throw new Error(`Backup manifest path escapes repository: ${relativePath}`);
-	}
-	const root = path.resolve(repoPath);
-	const resolved = path.resolve(root, normalized);
-	const relative = path.relative(root, resolved);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) {
-		throw new Error(`Backup manifest path escapes repository: ${relativePath}`);
-	}
-	return resolved;
-}
-
-function isPathInsideRoot(root: string, candidate: string) {
-	const relative = path.relative(root, candidate);
-	return (
-		relative === "" ||
-		(!relative.startsWith("..") && !path.isAbsolute(relative))
-	);
-}
-
-function assertBackupPathInsideRealRootEffect(
-	repoPath: string,
-	fullPath: string,
-): Effect.Effect<void, unknown> {
-	return Effect.gen(function* () {
-		const realRoot = yield* tryPromise(() => fs.realpath(repoPath));
-		const realPath = yield* tryPromise(() => fs.realpath(fullPath));
-		if (!isPathInsideRoot(realRoot, realPath)) {
-			return yield* Effect.fail(new Error("Backup path escapes repository"));
-		}
-	});
-}
-
-function assertReadableBackupFileEffect(
-	repoPath: string,
-	fullPath: string,
-	label: string,
-) {
-	return Effect.gen(function* () {
-		yield* assertNoSymlinkAncestorEffect(repoPath, fullPath);
-		const stat = yield* tryPromise(() => fs.lstat(fullPath));
-		if (!stat.isFile()) {
-			return yield* Effect.fail(
-				new Error(`Backup path is not a regular file: ${label}`),
-			);
-		}
-		yield* assertBackupPathInsideRealRootEffect(repoPath, fullPath);
-		return stat;
-	});
-}
-
-function assertNoSymlinkAncestorEffect(
-	repoPath: string,
-	fullPath: string,
-): Effect.Effect<void, unknown> {
-	return Effect.gen(function* () {
-		const root = path.resolve(repoPath);
-		const target = path.resolve(fullPath);
-		if (!isPathInsideRoot(root, target)) {
-			return yield* Effect.fail(new Error("Backup path escapes repository"));
-		}
-		const relative = path.relative(root, target);
-		let current = root;
-		for (const part of relative.split(path.sep).filter(Boolean)) {
-			current = path.join(current, part);
-			const stat = yield* tryPromise(() => fs.lstat(current)).pipe(
-				Effect.catchAll((error) =>
-					error &&
-					typeof error === "object" &&
-					"code" in error &&
-					error.code === "ENOENT"
-						? Effect.succeed(null)
-						: Effect.fail(error),
-				),
-			);
-			if (!stat) return;
-			if (stat.isSymbolicLink()) {
-				return yield* Effect.fail(
-					new Error(
-						`Backup path contains symlink: ${path.relative(root, current)}`,
-					),
-				);
-			}
-		}
-	});
-}
-
 function readJsonlFilesEffect(
 	repoPath: string,
 	relativePaths: string[],
@@ -3263,17 +3024,6 @@ function importBackupUnlockedEffect({
 			if (mode === "replace") {
 				repository.clearBackupImport();
 			}
-			const existingFtsIds = new Map<string, Set<string>>();
-			for (const codec of BACKUP_TABLE_CODECS) {
-				const fts = codec.merge.fts;
-				if (!fts) continue;
-				existingFtsIds.set(
-					codec.name,
-					mode === "replace"
-						? new Set<string>()
-						: repository.readFtsIds(fts.target),
-				);
-			}
 			const mergeCodecs = [...BACKUP_TABLE_CODECS].sort(
 				(left, right) => left.merge.order - right.merge.order,
 			);
@@ -3296,15 +3046,8 @@ function importBackupUnlockedEffect({
 					legacyProfileMergePlans = reconciled.legacyProfileMergePlans;
 				}
 				repository.insertRows(codec.merge.sql, rows, codec.merge.columns);
-				const fts = codec.merge.fts;
-				if (!fts) continue;
-				repository.insertFtsRows({
-					target: fts.target,
-					rows,
-					idKey: fts.idKey,
-					textKey: fts.textKey,
-					existingIds: existingFtsIds.get(codec.name),
-				});
+				if (codec.merge.searchKind)
+					repository.refreshSearchRows(codec.merge.searchKind, rows);
 			}
 			if (mode === "merge") {
 				finalizeBackupProfileRows({
@@ -3737,8 +3480,9 @@ function autoSyncConfigError(error: unknown): BackupAutoUpdateResult {
 	};
 }
 
-function runMaybeAutoUpdateBackupEffect(
+function runAutoBackupEffect(
 	db?: Database,
+	mode: "update" | "sync" = "update",
 ): Effect.Effect<BackupAutoUpdateResult, never> {
 	return Effect.gen(function* () {
 		if (process.env.BIRDCLAW_BACKUP_AUTO_SYNC === "0") {
@@ -3749,12 +3493,10 @@ function runMaybeAutoUpdateBackupEffect(
 				reason: "disabled by BIRDCLAW_BACKUP_AUTO_SYNC=0",
 			};
 		}
-		const configResult = yield* trySync(() => resolveAutoSyncConfig()).pipe(
-			Effect.map((config) => ({ ok: true as const, config })),
-			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
-		);
-		if (!configResult.ok) return autoSyncConfigError(configResult.error);
-		const { config } = configResult;
+		const configResult = yield* Effect.either(trySync(resolveAutoSyncConfig));
+		if (Either.isLeft(configResult))
+			return autoSyncConfigError(configResult.left);
+		const config = configResult.right;
 		if (!config) {
 			return {
 				ok: true,
@@ -3764,41 +3506,45 @@ function runMaybeAutoUpdateBackupEffect(
 			};
 		}
 
-		const state = db
-			? yield* trySync(() => readAutoSyncState(db)).pipe(
-					Effect.catchAll(() => Effect.succeed(null)),
-				)
-			: yield* trySync(() => readAutoSyncStateWithoutCreatingDatabase()).pipe(
-					Effect.catchAll(() => Effect.succeed(null)),
-				);
-		const checkedAt = state?.checkedAt
-			? new Date(state.checkedAt).getTime()
-			: 0;
-		const ageMs = Date.now() - checkedAt;
-		if (ageMs >= 0 && ageMs < config.staleAfterSeconds * 1000) {
-			return {
-				ok: true,
-				enabled: true,
-				skipped: true,
-				reason: "backup auto-sync is fresh",
-				repoPath: config.repoPath,
-				...(config.remote ? { remote: redactSecretUrl(config.remote) } : {}),
-			};
+		const state = yield* trySync(() =>
+			db ? readAutoSyncState(db) : readAutoSyncStateWithoutCreatingDatabase(),
+		).pipe(Effect.catchAll(() => Effect.succeed(null)));
+		if (mode === "update") {
+			const checkedAt = state?.checkedAt
+				? new Date(state.checkedAt).getTime()
+				: 0;
+			const ageMs = Date.now() - checkedAt;
+			if (ageMs >= 0 && ageMs < config.staleAfterSeconds * 1000) {
+				return {
+					ok: true,
+					enabled: true,
+					skipped: true,
+					reason: "backup auto-sync is fresh",
+					repoPath: config.repoPath,
+					...(config.remote ? { remote: redactSecretUrl(config.remote) } : {}),
+				};
+			}
 		}
 
 		const now = new Date().toISOString();
-		const result = yield* updateBackupFromGitEffect({
-			repoPath: config.repoPath,
-			remote: config.remote,
-			db,
-			appliedBackupHash: state?.backupHash,
-		}).pipe(
-			Effect.map((value) => ({ ok: true as const, value })),
-			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
+		const options = { repoPath: config.repoPath, remote: config.remote, db };
+		const result = yield* Effect.either(
+			mode === "update"
+				? updateBackupFromGitEffect({
+						...options,
+						appliedBackupHash: state?.backupHash,
+					})
+				: syncBackupEffect(options).pipe(
+						Effect.map((value) => ({
+							...value,
+							backupHash: value.exportResult.manifest.backupHash,
+						})),
+					),
 		);
 
-		if (result.ok) {
-			if (db || !result.value.pushOnly) {
+		if (Either.isRight(result)) {
+			const value = result.right;
+			if (db || !value.pushOnly) {
 				const database = yield* trySync(() => db ?? openBackupDatabase()).pipe(
 					Effect.orDie,
 				);
@@ -3806,37 +3552,42 @@ function runMaybeAutoUpdateBackupEffect(
 					writeAutoSyncState(database, {
 						checkedAt: now,
 						ok: true,
-						...(result.value.backupHash
-							? { backupHash: result.value.backupHash }
+						...(mode === "sync" || value.backupHash
+							? { backupHash: value.backupHash }
 							: state?.backupHash
 								? { backupHash: state.backupHash }
 								: {}),
 					}),
 				).pipe(Effect.orDie);
 			}
+			const unchanged =
+				mode === "update" && Boolean(value.backupHash) && !value.imported;
 			return {
 				ok: true,
 				enabled: true,
-				skipped: Boolean(result.value.backupHash) && !result.value.imported,
-				...(result.value.backupHash && !result.value.imported
+				skipped: unchanged,
+				...(unchanged
 					? { reason: "backup auto-sync manifest is unchanged" }
 					: {}),
-				repoPath: result.value.repoPath,
-				...(result.value.remote
-					? { remote: redactSecretUrl(result.value.remote) }
+				repoPath: value.repoPath,
+				...(value.remote
+					? {
+							remote:
+								mode === "update"
+									? redactSecretUrl(value.remote)
+									: value.remote,
+						}
 					: {}),
-				pulled: result.value.pulled,
-				imported: result.value.imported,
-				...(result.value.backupHash
-					? { backupHash: result.value.backupHash }
+				pulled: value.pulled,
+				imported: value.imported,
+				...(mode === "update" && value.backupHash
+					? { backupHash: value.backupHash }
 					: {}),
 			};
 		}
 
 		const message =
-			result.error instanceof Error
-				? result.error.message
-				: String(result.error);
+			result.left instanceof Error ? result.left.message : String(result.left);
 		if (db) {
 			yield* trySync(() =>
 				writeAutoSyncState(db, {
@@ -3852,8 +3603,15 @@ function runMaybeAutoUpdateBackupEffect(
 			enabled: true,
 			skipped: false,
 			repoPath: config.repoPath,
-			...(config.remote ? { remote: redactSecretUrl(config.remote) } : {}),
-			error: redactSecretUrl(message),
+			...(config.remote
+				? {
+						remote:
+							mode === "update"
+								? redactSecretUrl(config.remote)
+								: config.remote,
+					}
+				: {}),
+			error: mode === "update" ? redactSecretUrl(message) : message,
 		};
 	});
 }
@@ -3861,14 +3619,19 @@ function runMaybeAutoUpdateBackupEffect(
 export function maybeAutoUpdateBackupEffect(
 	db?: Database,
 ): Effect.Effect<BackupAutoUpdateResult, never> {
+	if (isReadOnlyDeployment())
+		return Effect.succeed({
+			ok: true,
+			enabled: false,
+			skipped: true,
+			reason: "read-only archive deployment",
+		});
 	if (autoUpdateInFlight) {
 		return Effect.promise(() => autoUpdateInFlight!);
 	}
 
 	return Effect.promise(() => {
-		const promise = runEffectPromise(
-			runMaybeAutoUpdateBackupEffect(db),
-		).finally(() => {
+		const promise = runEffectPromise(runAutoBackupEffect(db)).finally(() => {
 			if (autoUpdateInFlight === promise) {
 				autoUpdateInFlight = null;
 			}
@@ -3885,6 +3648,7 @@ export function maybeAutoUpdateBackup(
 }
 
 export function requestBackupAutoUpdate(db?: Database) {
+	if (isReadOnlyDeployment()) return;
 	if (autoUpdateBackgroundScheduled || autoUpdateInFlight) return;
 	autoUpdateBackgroundScheduled = true;
 	const timer = setTimeout(() => {
@@ -3910,93 +3674,14 @@ export function requestBackupAutoUpdate(db?: Database) {
 export function maybeAutoSyncBackupEffect(
 	db?: Database,
 ): Effect.Effect<BackupAutoUpdateResult, never> {
-	return Effect.gen(function* () {
-		if (process.env.BIRDCLAW_BACKUP_AUTO_SYNC === "0") {
-			return {
-				ok: true,
-				enabled: false,
-				skipped: true,
-				reason: "disabled by BIRDCLAW_BACKUP_AUTO_SYNC=0",
-			};
-		}
-		const configResult = yield* trySync(() => resolveAutoSyncConfig()).pipe(
-			Effect.map((config) => ({ ok: true as const, config })),
-			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
-		);
-		if (!configResult.ok) return autoSyncConfigError(configResult.error);
-		const { config } = configResult;
-		if (!config) {
-			return {
-				ok: true,
-				enabled: false,
-				skipped: true,
-				reason: "backup auto-sync is not configured",
-			};
-		}
-		const state = db
-			? yield* trySync(() => readAutoSyncState(db)).pipe(
-					Effect.catchAll(() => Effect.succeed(null)),
-				)
-			: yield* trySync(() => readAutoSyncStateWithoutCreatingDatabase()).pipe(
-					Effect.catchAll(() => Effect.succeed(null)),
-				);
-		const now = new Date().toISOString();
-		const result = yield* syncBackupEffect({
-			repoPath: config.repoPath,
-			remote: config.remote,
-			db,
-		}).pipe(
-			Effect.map((value) => ({ ok: true as const, value })),
-			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
-		);
-
-		if (result.ok) {
-			if (db || !result.value.pushOnly) {
-				const database = yield* trySync(() => db ?? openBackupDatabase()).pipe(
-					Effect.orDie,
-				);
-				yield* trySync(() =>
-					writeAutoSyncState(database, {
-						checkedAt: now,
-						ok: true,
-						backupHash: result.value.exportResult.manifest.backupHash,
-					}),
-				).pipe(Effect.orDie);
-			}
-			return {
-				ok: true,
-				enabled: true,
-				skipped: false,
-				repoPath: result.value.repoPath,
-				...(result.value.remote ? { remote: result.value.remote } : {}),
-				pulled: result.value.pulled,
-				imported: result.value.imported,
-			};
-		}
-
-		const message =
-			result.error instanceof Error
-				? result.error.message
-				: String(result.error);
-		if (db) {
-			yield* trySync(() =>
-				writeAutoSyncState(db, {
-					checkedAt: now,
-					ok: false,
-					error: message,
-					...(state?.backupHash ? { backupHash: state.backupHash } : {}),
-				}),
-			).pipe(Effect.orDie);
-		}
-		return {
-			ok: false,
-			enabled: true,
-			skipped: false,
-			repoPath: config.repoPath,
-			...(config.remote ? { remote: config.remote } : {}),
-			error: message,
-		};
-	});
+	if (isReadOnlyDeployment())
+		return Effect.succeed({
+			ok: true,
+			enabled: false,
+			skipped: true,
+			reason: "read-only archive deployment",
+		});
+	return runAutoBackupEffect(db, "sync");
 }
 
 export function maybeAutoSyncBackup(
@@ -4037,82 +3722,49 @@ export function validateBackupEffect(
 			manifest.files,
 			(expected) =>
 				Effect.gen(function* () {
-					const fileErrors: string[] = [];
-					let file: BackupFileManifest | undefined;
 					const filePath = yield* trySync(() =>
 						resolveBackupFilePath(resolvedRepoPath, expected.path),
-					).pipe(
-						Effect.match({
-							onFailure: (error) => {
-								fileErrors.push(
-									`${expected.path}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-								return undefined;
-							},
-							onSuccess: (value) => value,
-						}),
 					);
-					if (!filePath) {
-						return { file, errors: fileErrors };
-					}
-					const stat = yield* assertReadableBackupFileEffect(
+					yield* assertReadableBackupFileEffect(
 						resolvedRepoPath,
 						filePath,
 						expected.path,
-					).pipe(
-						Effect.match({
-							onFailure: (error) => {
-								fileErrors.push(
-									`${expected.path}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-								return undefined;
-							},
-							onSuccess: (value) => value,
-						}),
 					);
-					if (!stat) {
-						return { file, errors: fileErrors };
+					const content = yield* tryPromise(() => fs.readFile(filePath));
+					const rows = content
+						.toString("utf8")
+						.split("\n")
+						.filter((line) => line.length > 0);
+					const fileErrors: string[] = [];
+					for (const [index, line] of rows.entries()) {
+						yield* trySync(() => JSON.parse(line)).pipe(
+							Effect.match({
+								onFailure: (error) => {
+									fileErrors.push(
+										`${expected.path}:${index + 1}: ${error.message}`,
+									);
+								},
+								onSuccess: () => undefined,
+							}),
+						);
 					}
-					const content = yield* tryPromise(() => fs.readFile(filePath)).pipe(
-						Effect.match({
-							onFailure: (error) => {
-								fileErrors.push(
-									`${expected.path}: ${error instanceof Error ? error.message : String(error)}`,
-								);
-								return undefined;
-							},
-							onSuccess: (value) => value,
-						}),
-					);
-					if (content) {
-						const text = content.toString("utf8");
-						const rows = text.split("\n").filter((line) => line.length > 0);
-						for (const [index, line] of rows.entries()) {
-							const parseError = yield* trySync(() => JSON.parse(line)).pipe(
-								Effect.match({
-									onFailure: (error) => error,
-									onSuccess: () => undefined,
-								}),
-							);
-							if (parseError) {
-								fileErrors.push(
-									`${expected.path}:${index + 1}: ${
-										parseError instanceof Error
-											? parseError.message
-											: String(parseError)
-									}`,
-								);
-							}
-						}
-						file = {
+					return {
+						file: {
 							path: expected.path,
 							rows: rows.length,
 							sha256: sha256(content),
 							bytes: content.byteLength,
-						};
-					}
-					return { file, errors: fileErrors };
-				}),
+						},
+						errors: fileErrors,
+					};
+				}).pipe(
+					Effect.catchAll((error) =>
+						Effect.succeed({
+							file: undefined,
+							errors: [`${expected.path}: ${toError(error).message}`],
+						}),
+					),
+				),
 			{ concurrency: 1 },
 		);
 

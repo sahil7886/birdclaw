@@ -113,6 +113,58 @@ const item = {
 };
 
 describe("TimelineCard", () => {
+	it.each([false, true])(
+		"opens each tweet on X without toggling its thread (readOnly=%s)",
+		(readOnly) => {
+			const onReply = vi.fn();
+			renderWithQueryClient(
+				<ConversationSurfaceScope>
+					<TimelineCard
+						item={{
+							...item,
+							id: "2030857479001960633",
+							replyToTweet: { ...item.replyToTweet, id: "20" },
+							quotedTweet: { ...item.quotedTweet, id: "2030857479001960634" },
+						}}
+						onReply={onReply}
+					/>
+				</ConversationSurfaceScope>,
+				{ readOnly },
+			);
+			const links = screen.getAllByRole("link", { name: /^Open on X/ });
+			expect(links.map((link) => link.getAttribute("href"))).toEqual([
+				"https://x.com/i/status/20",
+				"https://x.com/i/status/2030857479001960634",
+				"https://x.com/i/status/2030857479001960633",
+			]);
+			for (const link of links) {
+				expect(link).toHaveAttribute("target", "_blank");
+				expect(link).toHaveAttribute("rel", "noopener noreferrer");
+				expect(link).toHaveAccessibleName("Open on X (opens in a new tab)");
+				fireEvent.click(link);
+				expect(
+					screen.getByRole("button", { name: "Show conversation" }),
+				).toHaveAttribute("aria-expanded", "false");
+			}
+			expect(onReply).not.toHaveBeenCalled();
+		},
+	);
+
+	it("keeps cached tweet content without reply or analysis actions in read-only mode", () => {
+		renderWithQueryClient(
+			<ConversationSurfaceScope>
+				<TimelineCard item={item} onReply={vi.fn()} />
+			</ConversationSurfaceScope>,
+			{ readOnly: true },
+		);
+		expect(
+			screen.queryByRole("button", { name: "Reply" }),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("link", { name: /Analyse/ }),
+		).not.toBeInTheDocument();
+		expect(screen.getAllByText("Sam Altman").length).toBeGreaterThan(0);
+	});
 	afterEach(() => {
 		cleanup();
 		vi.unstubAllGlobals();
@@ -130,9 +182,10 @@ describe("TimelineCard", () => {
 		expect(screen.getAllByText("Quoted tweet")[1]).toBeInTheDocument();
 		expect(screen.getByAltText("Demo image")).toBeInTheDocument();
 		expect(screen.getByText("Demo link")).toBeInTheDocument();
-		expect(
-			screen.queryByRole("img", { name: "Demo link" }),
-		).not.toBeInTheDocument();
+		expect(screen.getByRole("img", { name: "Demo link" })).toHaveAttribute(
+			"src",
+			"/api/link-preview?imageUrl=https%3A%2F%2Fexample.com%2Fpreview.jpg",
+		);
 		expect(container.querySelectorAll("header p")).toHaveLength(0);
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_1");
@@ -195,19 +248,17 @@ describe("TimelineCard", () => {
 		expect(screen.queryByText("not bookmarked")).not.toBeInTheDocument();
 		expect(screen.queryByText("Reposted tweet")).not.toBeInTheDocument();
 		expect(screen.queryByText(/RT @ava/)).not.toBeInTheDocument();
+		expect(screen.getByRole("link", { name: /^Open on X/ })).toHaveAttribute(
+			"href",
+			"https://x.com/i/status/tweet_original",
+		);
 
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_original");
 
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
-		// Row tap is dismiss-only now: plain-text taps never open a thread, so
-		// opening is verified via the explicit Thread button instead.
-		fireEvent.click(
-			within(row as HTMLElement).getByRole("button", {
-				name: "Show conversation",
-			}),
-		);
+		fireEvent.click(row);
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_original",
 		);
@@ -255,15 +306,14 @@ describe("TimelineCard", () => {
 		expect(screen.getByText("Original app idea")).toBeInTheDocument();
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_manual");
+		expect(screen.getByRole("link", { name: /^Open on X/ })).toHaveAttribute(
+			"href",
+			"https://x.com/i/status/tweet_manual",
+		);
 
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
-		// Dismiss-only row tap: open via the explicit Thread button.
-		fireEvent.click(
-			within(row as HTMLElement).getByRole("button", {
-				name: "Show conversation",
-			}),
-		);
+		fireEvent.click(row);
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_manual",
 		);
@@ -331,12 +381,7 @@ describe("TimelineCard", () => {
 		const second = rows[1];
 		if (!first || !second) throw new Error("timeline cards missing");
 
-		// Dismiss-only row tap: open the first row via its Thread button.
-		fireEvent.click(
-			within(first as HTMLElement).getByRole("button", {
-				name: "Show conversation",
-			}),
-		);
+		fireEvent.click(first);
 
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/conversation?tweetId=tweet_original",
@@ -354,6 +399,16 @@ describe("TimelineCard", () => {
 		expect(
 			await screen.findByText("Original conversation"),
 		).toBeInTheDocument();
+		const thread = screen.getByRole("region", { name: "Conversation" });
+		const threadLinks = within(thread).getAllByRole("link", {
+			name: /^Open on X/,
+		});
+		expect(threadLinks.map((link) => link.getAttribute("href"))).toEqual([
+			"https://x.com/i/status/tweet_original",
+			"https://x.com/i/status/tweet_original_reply",
+		]);
+		fireEvent.click(threadLinks[1]!);
+		expect(thread).toBeInTheDocument();
 	});
 
 	it("keeps link preview cards on native retweets", () => {
@@ -513,7 +568,12 @@ describe("TimelineCard", () => {
 		expect(
 			screen.getByRole("link", { name: "example.com/kept" }),
 		).toBeInTheDocument();
-		expect(screen.getAllByText("example.com/kept").length).toBeGreaterThan(1);
+		expect(screen.getAllByText("example.com/kept")).toHaveLength(1);
+		expect(
+			screen.getByRole("link", {
+				name: "Open example.com/kept (opens in a new tab)",
+			}),
+		).toHaveAttribute("href", "https://example.com/kept");
 	});
 
 	it("renders direct image URL cards with the image immediately", () => {
@@ -966,7 +1026,7 @@ describe("TimelineCard", () => {
 		expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 	});
 
-	it("dismisses any open conversation when the tweet row is tapped", async () => {
+	it("expands the archived conversation when the tweet row is clicked", async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
 			json: async () => ({
@@ -1001,22 +1061,15 @@ describe("TimelineCard", () => {
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
 
-		// Open via the explicit Thread button, then verify a plain-text row tap
-		// only dismisses (and never re-opens or fetches again).
-		fireEvent.click(
-			within(row as HTMLElement).getByRole("button", {
-				name: "Show conversation",
-			}),
-		);
-		expect(await screen.findByText("Parent in thread")).toBeInTheDocument();
-
 		fireEvent.click(row);
 
-		expect(screen.queryByText("Parent in thread")).not.toBeInTheDocument();
-		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_1");
+		expect(await screen.findByText("Parent in thread")).toBeInTheDocument();
+		expect(screen.getByText("2 tweets in conversation")).toBeInTheDocument();
+		expect(screen.getByText("selected")).toBeInTheDocument();
 	});
 
-	it("dismisses a thread opened from another row via plain-text tap", async () => {
+	it("prefetches conversation context on hover and keeps one thread open", async () => {
 		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
 			const tweetId = new URL(
 				String(input),
@@ -1062,33 +1115,20 @@ describe("TimelineCard", () => {
 		const second = rows[1];
 		if (!first || !second) throw new Error("timeline cards missing");
 
-		// Open tweet_a's thread from its explicit Thread button.
 		fireEvent.mouseEnter(first);
 		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_a");
-		fireEvent.click(
-			within(first as HTMLElement).getByRole("button", {
-				name: "Show conversation",
-			}),
-		);
+
+		fireEvent.click(first);
 		expect(
 			await screen.findByText("Conversation for tweet_a"),
 		).toBeInTheDocument();
 
-		// Plain-text tap on the OTHER row dismisses the open thread...
 		fireEvent.click(second);
 		expect(
-			screen.queryByText("Conversation for tweet_a"),
-		).not.toBeInTheDocument();
-		// ...and does not open tweet_b's thread or fetch its conversation.
-		expect(fetchMock).not.toHaveBeenCalledWith(
-			"/api/conversation?tweetId=tweet_b",
-		);
-
-		// Tapping the row that owns the (now closed) thread stays closed too.
-		fireEvent.click(first);
+			await screen.findByText("Conversation for tweet_b"),
+		).toBeInTheDocument();
 		expect(
 			screen.queryByText("Conversation for tweet_a"),
 		).not.toBeInTheDocument();
-		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });

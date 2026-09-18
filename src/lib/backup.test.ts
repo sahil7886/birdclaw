@@ -6,6 +6,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	readlinkSync,
 	readdirSync,
 	realpathSync,
 	renameSync,
@@ -41,6 +42,7 @@ import {
 import { BACKUP_TABLE_CODECS } from "./backup-table-codecs";
 import { getBirdclawPaths, resetBirdclawPathsForTests } from "./config";
 import { getNativeDb } from "./db";
+import { refreshSearchRows } from "./search-index";
 import { syncIdentitySearchIndexForProfileIds } from "./identity-search-index";
 import NativeSqliteDatabase, { type Database } from "./sqlite";
 import { acquireScheduledJobLock } from "./scheduled-job";
@@ -188,6 +190,19 @@ function clearData() {
 	`);
 }
 
+function setNoteTweet(
+	db: Database,
+	id: string,
+	text: string,
+	entities: object,
+) {
+	const entitiesJson = JSON.stringify(entities);
+	db.prepare(
+		"update tweets set text = ?, entities_json = ?, note_tweet_json = ? where id = ?",
+	).run(text, entitiesJson, JSON.stringify({ text, entities }), id);
+	refreshSearchRows(db, "tweet", [id]);
+}
+
 function writeBackupConfig(
 	home: string,
 	backup: {
@@ -199,6 +214,13 @@ function writeBackupConfig(
 ) {
 	writeFileSync(path.join(home, "config.json"), JSON.stringify({ backup }));
 	resetBirdclawPathsForTests();
+}
+
+function seedMinimalBackupFixture() {
+	const db = testHome().db;
+	insertTestAccount(db);
+	const profile = insertTestProfile(db);
+	return insertTestTweet(db, { authorProfileId: profile.id });
 }
 
 function seedBackupFixture() {
@@ -273,11 +295,6 @@ function seedBackupFixture() {
       ('acct_primary', 'tweet_2024', 'home', '2024-12-31T23:59:00.000Z', '2024-12-31T23:59:00.000Z', 1, 'archive', '{}', '2025-01-03T00:00:00.000Z'),
       ('acct_primary', 'tweet_2025', 'search', '2025-01-02T09:00:00.000Z', '2025-01-02T09:00:00.000Z', 1, 'bird', '{"query":"useful"}', '2025-01-03T00:00:00.000Z');
 
-    insert into tweets_fts (tweet_id, text) values
-      ('tweet_2024', 'Shipping text backups'),
-      ('tweet_2025', 'Saved useful thing'),
-      ('tweet_unknown_date', 'Unknown creation date like');
-
     insert into tweet_sources (tweet_id, source, source_url, observed_at)
     values (
       'tweet_2024', 'fxtwitter',
@@ -317,10 +334,6 @@ function seedBackupFixture() {
     ) values
       ('dm_1', 'dm:friend', 'profile_friend', 'Backup this please', '2025-01-05T09:00:00.000Z', 'inbound', 0, 0),
       ('dm_2', 'dm:friend', 'profile_me', 'On it', '2025-01-05T10:00:00.000Z', 'outbound', 1, 0);
-
-    insert into dm_fts (message_id, text) values
-      ('dm_1', 'Backup this please'),
-      ('dm_2', 'On it');
 
     insert into url_expansions (
       short_url, expanded_url, final_url, status, expanded_tweet_id,
@@ -395,6 +408,12 @@ function seedBackupFixture() {
       'follow_snapshot_1'
     );
   `);
+	refreshSearchRows(db, "tweet", [
+		"tweet_2024",
+		"tweet_2025",
+		"tweet_unknown_date",
+	]);
+	refreshSearchRows(db, "dm", ["dm_1", "dm_2"]);
 }
 
 function expectNoDemoSeedRows() {
@@ -444,7 +463,7 @@ describe("text backup", () => {
 
 	it("exposes backup export, import, and validation as Effects", async () => {
 		switchHome("birdclaw-backup-effect-src-");
-		seedBackupFixture();
+		const tweet = seedMinimalBackupFixture();
 		const repoPath = makeTempDir("birdclaw-backup-effect-store-");
 
 		const exported = await Effect.runPromise(exportBackupEffect({ repoPath }));
@@ -459,6 +478,24 @@ describe("text backup", () => {
 		expect(validation.ok).toBe(true);
 		expect(imported.ok).toBe(true);
 		expect(imported.mode).toBe("replace");
+		expect(exported.manifest.counts).toMatchObject({
+			accounts: 1,
+			profiles: 1,
+			tweets: 1,
+		});
+		const db = testHome().db;
+		expect(
+			db.prepare("select text from tweets where id = ?").get(tweet.id),
+		).toEqual({
+			text: tweet.text,
+		});
+		expect(
+			db
+				.prepare("select text from tweets_fts where tweet_id = ?")
+				.get(tweet.id),
+		).toEqual({
+			text: tweet.text,
+		});
 	}, 20000);
 
 	it("rejects backup export paths that traverse symlinked managed directories", async () => {
@@ -507,56 +544,69 @@ describe("text backup", () => {
 		);
 	});
 
-	it("rejects ignored, non-Git, and dangling-symlink data extras before publication", async () => {
-		switchHome("birdclaw-backup-extra-home-");
-		seedBackupFixture();
-		const repoPath = makeTempDir("birdclaw-backup-extra-repo-");
-		await exportBackup({ repoPath });
-		const privatePath = path.join(repoPath, "data", "private.json");
-		writeFileSync(privatePath, "private\n");
-		await expect(validateBackup(repoPath)).resolves.toMatchObject({
-			ok: false,
-			errors: expect.arrayContaining([
-				"Unexpected backup data file: data/private.json",
-			]),
-		});
-		await expect(exportBackup({ repoPath })).rejects.toThrow(
-			"Unexpected backup data file: data/private.json",
-		);
-		rmSync(privatePath);
-
-		const danglingPath = path.join(repoPath, "data", "dangling.jsonl");
-		symlinkSync(path.join(repoPath, "missing-target"), danglingPath);
-		await expect(validateBackup(repoPath)).resolves.toMatchObject({
-			ok: false,
-			errors: expect.arrayContaining([
-				"Unexpected symlink in backup data: data/dangling.jsonl",
-			]),
-		});
-		await expect(exportBackup({ repoPath })).rejects.toThrow(
-			"Unexpected symlink in backup data: data/dangling.jsonl",
-		);
-		rmSync(danglingPath);
-
-		await exportBackup({ repoPath, commit: true });
-		writeFileSync(path.join(repoPath, ".gitignore"), "data/private.json\n");
-		execFileSync("git", ["-C", repoPath, "add", ".gitignore"]);
-		execFileSync("git", [
-			"-C",
-			repoPath,
-			"commit",
-			"-m",
-			"test: ignore private data",
-		]);
-		writeFileSync(privatePath, "ignored private\n");
-		await expect(exportBackup({ repoPath })).rejects.toThrow(
-			"Unexpected backup data file: data/private.json",
-		);
-	}, 20000);
+	it.each(["non-Git file", "dangling symlink", "Git-ignored file"] as const)(
+		"rejects a %s data extra before publication",
+		async (extra) => {
+			seedMinimalBackupFixture();
+			const repoPath = makeTempDir("birdclaw-backup-extra-repo-");
+			const ignored = extra === "Git-ignored file";
+			await exportBackup({ repoPath, commit: ignored });
+			if (ignored) {
+				writeFileSync(path.join(repoPath, ".gitignore"), "data/private.json\n");
+				execFileSync("git", ["-C", repoPath, "add", ".gitignore"]);
+				execFileSync("git", [
+					"-C",
+					repoPath,
+					"-c",
+					"commit.gpgsign=false",
+					"commit",
+					"-m",
+					"test: ignore private data",
+				]);
+			}
+			const before = snapshotTree(repoPath);
+			const dangling = extra === "dangling symlink";
+			const extraPath = path.join(
+				repoPath,
+				"data",
+				dangling ? "dangling.jsonl" : "private.json",
+			);
+			const targetPath = path.join(repoPath, "missing-target");
+			if (dangling) symlinkSync(targetPath, extraPath);
+			else writeFileSync(extraPath, "private\n");
+			if (ignored) {
+				execFileSync("git", [
+					"-C",
+					repoPath,
+					"check-ignore",
+					"--quiet",
+					"data/private.json",
+				]);
+			}
+			const error = dangling
+				? "Unexpected symlink in backup data: data/dangling.jsonl"
+				: "Unexpected backup data file: data/private.json";
+			await expect(validateBackup(repoPath)).resolves.toMatchObject({
+				ok: false,
+				errors: expect.arrayContaining([error]),
+			});
+			await expect(exportBackup({ repoPath })).rejects.toThrow(error);
+			for (const [relativePath, content] of before) {
+				expect(readFileSync(path.join(repoPath, relativePath))).toEqual(
+					content,
+				);
+			}
+			const preservedExtra = dangling
+				? readlinkSync(extraPath)
+				: readFileSync(extraPath, "utf8");
+			expect(preservedExtra).toBe(dangling ? targetPath : "private\n");
+		},
+		20000,
+	);
 
 	it("builds backup import effects lazily", async () => {
 		switchHome("birdclaw-backup-import-src-");
-		seedBackupFixture();
+		const tweet = seedMinimalBackupFixture();
 		const repoPath = makeTempDir("birdclaw-backup-import-store-");
 
 		const effect = importBackupEffect({ repoPath, mode: "replace" });
@@ -571,8 +621,8 @@ describe("text backup", () => {
 		expect(imported.mode).toBe("replace");
 		expect(
 			getNativeDb({ seedDemoData: false })
-				.prepare("select count(*) as count from tweets where id = 'tweet_2025'")
-				.get(),
+				.prepare("select count(*) as count from tweets where id = ?")
+				.get(tweet.id),
 		).toEqual({ count: 1 });
 	}, 20000);
 
@@ -830,6 +880,42 @@ describe("text backup", () => {
 		expect(validation.ok).toBe(true);
 	}, 20000);
 
+	it("round-trips Note Tweets and their FTS content through backups", async () => {
+		switchHome("birdclaw-backup-note-src-");
+		seedBackupFixture();
+		const text = "Full backup Note Tweet backuptailneedle #longform";
+		const entities = {
+			hashtags: [{ tag: "longform", start: 45, end: 54 }],
+		};
+		setNoteTweet(getNativeDb(), "tweet_2024", text, entities);
+		const repoPath = makeTempDir("birdclaw-backup-note-store-");
+		await exportBackup({ repoPath });
+
+		switchHome("birdclaw-backup-note-dst-");
+		await importBackup({ repoPath, mode: "replace" });
+		const db = getNativeDb({ seedDemoData: false });
+		const row = db
+			.prepare(
+				"select text, entities_json, note_tweet_json from tweets where id = 'tweet_2024'",
+			)
+			.get() as {
+			text: string;
+			entities_json: string;
+			note_tweet_json: string;
+		};
+
+		expect(row.text).toBe(text);
+		expect(JSON.parse(row.entities_json)).toEqual(entities);
+		expect(JSON.parse(row.note_tweet_json)).toEqual({ text, entities });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweets_fts match 'backuptailneedle'",
+				)
+				.get(),
+		).toEqual({ count: 1 });
+	}, 20000);
+
 	it("exports and syncs a fresh empty store with a staged data directory", async () => {
 		const remotePath = path.join(
 			makeTempDir("birdclaw-empty-remote-"),
@@ -912,7 +998,7 @@ describe("text backup", () => {
 		expect(topologyQueries).toBe(0);
 	});
 
-	it("emits byte-identical schema-v8 data and hashes for the same database", async () => {
+	it("emits byte-identical current-schema data and hashes for the same database", async () => {
 		switchHome("birdclaw-backup-stable-src-");
 		seedBackupFixture();
 		const firstRepoPath = makeTempDir("birdclaw-backup-stable-first-");
@@ -989,6 +1075,56 @@ describe("text backup", () => {
 				.get(),
 		).toEqual({ inbox_kind: "request" });
 	});
+
+	it("merges backup tweets using the richer Note Tweet representation", async () => {
+		switchHome("birdclaw-backup-note-merge-src-");
+		seedBackupFixture();
+		const incomingText = "Incoming backup Note Tweet incomingnoteneedle";
+		const incomingEntities = {
+			hashtags: [{ tag: "incoming", start: 21, end: 30 }],
+		};
+		setNoteTweet(getNativeDb(), "tweet_2024", incomingText, incomingEntities);
+		const repoPath = makeTempDir("birdclaw-backup-note-merge-store-");
+		await exportBackup({ repoPath });
+
+		switchHome("birdclaw-backup-note-merge-dst-");
+		seedBackupFixture();
+		const db = getNativeDb({ seedDemoData: false });
+		const localText = "Local Note Tweet localnoteneedle";
+		const localEntities = {
+			hashtags: [{ tag: "local", start: 17, end: 23 }],
+		};
+		setNoteTweet(db, "tweet_2025", localText, localEntities);
+
+		await importBackup({ repoPath });
+
+		const rows = db
+			.prepare(
+				"select id, text, entities_json, note_tweet_json from tweets where id in ('tweet_2024', 'tweet_2025') order by id",
+			)
+			.all() as Array<{
+			id: string;
+			text: string;
+			entities_json: string;
+			note_tweet_json: string;
+		}>;
+		expect(rows.map((row) => row.text)).toEqual([incomingText, localText]);
+		expect(rows.map((row) => JSON.parse(row.entities_json))).toEqual([
+			incomingEntities,
+			localEntities,
+		]);
+		expect(rows.map((row) => JSON.parse(row.note_tweet_json))).toEqual([
+			{ text: incomingText, entities: incomingEntities },
+			{ text: localText, entities: localEntities },
+		]);
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweets_fts match 'incomingnoteneedle OR localnoteneedle'",
+				)
+				.get(),
+		).toEqual({ count: 2 });
+	}, 20000);
 
 	it("merges backup rows without deleting local-only tweets", async () => {
 		switchHome("birdclaw-backup-src-");
@@ -4330,6 +4466,27 @@ describe("text backup", () => {
 					},
 				).trim(),
 			).toBe("1");
+			expect(result).not.toHaveProperty("backupHash");
+			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
+				ok: true,
+				skipped: true,
+				reason: "backup auto-sync is fresh",
+			});
+			getNativeDb().exec(`
+        insert into profiles (id, handle, display_name, bio, followers_count, avatar_hue, created_at)
+        values ('profile_fresh_sync', 'fresh_sync', 'Fresh Sync', '', 0, 0, '2026-09-12T00:00:00Z')
+      `);
+			await expect(maybeAutoSyncBackup()).resolves.toMatchObject({
+				ok: true,
+				skipped: false,
+			});
+			expect(
+				execFileSync(
+					"git",
+					["--git-dir", remotePath, "rev-list", "--count", "refs/heads/main"],
+					{ encoding: "utf8" },
+				).trim(),
+			).toBe("2");
 		} finally {
 			if (previousAutoSyncEnv === undefined) {
 				delete process.env.BIRDCLAW_BACKUP_AUTO_SYNC;

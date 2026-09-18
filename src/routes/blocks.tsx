@@ -1,4 +1,6 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
+import { useDeploymentMode } from "#/lib/deployment-mode";
 import {
 	keepPreviousData,
 	useQuery,
@@ -63,12 +65,12 @@ export function BlocksRouteView({
 	onSearchChange?: RouteSearchChange<BlocksRouteSearch>;
 } = {}) {
 	const queryClient = useQueryClient();
-	const [localSearch, setLocalSearch] = useState(() =>
-		validateBlocksSearch({}),
+	const { readOnly, ready } = useDeploymentMode();
+	const { searchState, updateSearch } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateBlocksSearch,
 	);
-	const searchState = controlledSearch ?? localSearch;
-	const updateSearch: RouteSearchChange<BlocksRouteSearch> = (next, options) =>
-		onSearchChange ? onSearchChange(next, options) : setLocalSearch(next);
 	const accountId = searchState.account;
 	const search = searchState.q;
 	const searchStateRef = useRef(searchState);
@@ -117,7 +119,7 @@ export function BlocksRouteView({
 	const matches = blocksQuery.data?.matches ?? [];
 	const blockSyncQuery = useQuery({
 		queryKey: [...queryKeys.blockSync, accountId],
-		enabled: hasAccountId,
+		enabled: hasAccountId && ready && !readOnly,
 		retry: false,
 		queryFn: async () => {
 			const data = await postAction({
@@ -248,7 +250,9 @@ export function BlocksRouteView({
 					<div className="flex min-w-0 flex-col">
 						<h1 className={pageTitleClass}>Blocks</h1>
 						<h2 className={cx(pageSubtitleClass, "text-[14px]")}>
-							Maintain a clean blocklist locally.
+							{readOnly
+								? "Read the cached blocklist."
+								: "Maintain a clean blocklist locally."}
 						</h2>
 						<p className={pageSubtitleClass}>{subtitle}</p>
 					</div>
@@ -284,6 +288,7 @@ export function BlocksRouteView({
 					<button
 						className={primaryButtonClass}
 						disabled={!hasAccountId || isSubmitting || !searchInput.trim()}
+						hidden={readOnly}
 						onClick={() => void submit("blockProfile", searchInput)}
 						type="button"
 					>
@@ -327,6 +332,7 @@ export function BlocksRouteView({
 										className={
 											match.isBlocked ? secondaryButtonClass : dangerButtonClass
 										}
+										hidden={readOnly}
 										onClick={() =>
 											void submit(
 												match.isBlocked ? "unblockProfile" : "blockProfile",
@@ -381,6 +387,7 @@ export function BlocksRouteView({
 								</div>
 								<button
 									className={secondaryButtonClass}
+									hidden={readOnly}
 									onClick={() => void submit("unblockProfile", item.profile.id)}
 									type="button"
 								>

@@ -6,7 +6,8 @@ import { renderWithQueryClient as render } from "#/test/render";
 
 const routerState = vi.hoisted(() => ({ path: "/inbox" }));
 
-vi.mock("@tanstack/react-router", () => ({
+vi.mock("@tanstack/react-router", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@tanstack/react-router")>()),
 	Link: ({
 		children,
 		to,
@@ -43,6 +44,25 @@ afterEach(() => {
 });
 
 describe("AppNav", () => {
+	it("keeps cached archive navigation and hides live-only pages in read-only mode", () => {
+		render(
+			<ThemeProvider>
+				<AppNav />
+			</ThemeProvider>,
+			{ readOnly: true },
+		);
+		expect(screen.getByRole("link", { name: "Home" })).toBeInTheDocument();
+		expect(screen.getByRole("link", { name: "DMs" })).toBeInTheDocument();
+		for (const name of [
+			"Today",
+			"Discuss",
+			"Analyse",
+			"Sources",
+			"Rate Limits",
+		])
+			expect(screen.queryByRole("link", { name })).not.toBeInTheDocument();
+		expect(screen.getByText("Read-only archive")).toBeInTheDocument();
+	});
 	it("marks the active route", () => {
 		render(
 			<ThemeProvider>

@@ -5,7 +5,9 @@ import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
+import { NativeSqliteDatabase } from "./sqlite";
 import { ingestTweetPayload } from "./tweet-repository";
+import { refreshSearchRows } from "./search-index";
 import {
 	editHistoryIdsFromPayload,
 	mergeTweetRevisionChain,
@@ -14,6 +16,91 @@ import {
 } from "./tweet-retention";
 
 let tempRoot: string | undefined;
+
+it("reconciles each payload author once and observes new profile data in the next payload", () => {
+	tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-author-reuse-"));
+	process.env.BIRDCLAW_HOME = tempRoot;
+	resetBirdclawPathsForTests();
+	resetDatabaseForTests();
+	getNativeDb({ seedDemoData: false });
+	let snapshots = 0;
+	const db = new NativeSqliteDatabase(path.join(tempRoot, "birdclaw.sqlite"), {
+		onStatement: (sql) => {
+			if (/insert into profile_snapshots/i.test(sql)) snapshots++;
+		},
+	});
+	const users = [
+		{ id: "42", username: "first", name: "First" },
+		{ id: "43", username: "second", name: "Second" },
+	];
+	const tweets = Array.from({ length: 30 }, (_, i) => ({
+		id: `reuse_${i}`,
+		author_id: String(42 + (i % 2)),
+		text: `Post ${i}`,
+		created_at: "2026-09-12T10:00:00Z",
+	}));
+	try {
+		const ingest = (name: string) =>
+			ingestTweetPayload(db, {
+				accountId: "fixture",
+				source: "test",
+				payload: {
+					data: tweets,
+					includes: {
+						users: users.map((user) =>
+							user.id === "42" ? { ...user, name } : user,
+						),
+						tweets: [{ ...tweets[0]!, id: "included_reuse" }],
+					},
+				},
+			});
+		ingest("First");
+		expect(snapshots).toBe(2);
+		snapshots = 0;
+		ingest("Updated First");
+		expect(snapshots).toBe(4);
+		expect(
+			db
+				.prepare("select display_name from profiles where id='profile_user_42'")
+				.get(),
+		).toEqual({ display_name: "Updated First" });
+		expect(
+			db
+				.prepare(
+					"select distinct author_profile_id from tweets order by author_profile_id",
+				)
+				.all(),
+		).toEqual([
+			{ author_profile_id: "profile_user_42" },
+			{ author_profile_id: "profile_user_43" },
+		]);
+		expect(db.prepare("select count(*) as count from tweets").get()).toEqual({
+			count: 31,
+		});
+		expect(
+			db
+				.prepare(
+					"select distinct display_name from profile_snapshots where profile_id='profile_user_42' order by display_name",
+				)
+				.all(),
+		).toEqual([{ display_name: "First" }, { display_name: "Updated First" }]);
+		ingestTweetPayload(db, {
+			accountId: "fixture",
+			source: "test",
+			payload: {
+				data: [tweets[0]!, tweets[1]!, tweets[2]!],
+				includes: {
+					users: users.map((user) => ({ ...user, username: "shared" })),
+				},
+			},
+		});
+		expect(
+			db.prepare("select id from profiles where handle='shared'").get(),
+		).toEqual({ id: "profile_user_42" });
+	} finally {
+		db.close();
+	}
+});
 
 afterEach(() => {
 	resetDatabaseForTests();
@@ -77,6 +164,94 @@ it("marks only primary replies as replied", () => {
 		{ id: "liked_reply", is_replied: 1, reply_to_id: "primary_parent" },
 		{ id: "quoted_reply", is_replied: 0, reply_to_id: "quoted_parent" },
 	]);
+});
+
+it("preserves Note Tweet content when a later payload omits it", () => {
+	tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-test-"));
+	process.env.BIRDCLAW_HOME = tempRoot;
+	resetBirdclawPathsForTests();
+	resetDatabaseForTests();
+	const db = getNativeDb({ seedDemoData: false });
+	const users = [{ id: "42", username: "sam", name: "Sam" }];
+	const noteEntities = {
+		hashtags: [{ tag: "longform", start: 32, end: 41 }],
+	};
+
+	ingestTweetPayload(db, {
+		accountId: "acct_primary",
+		source: "xurl",
+		payload: {
+			data: [
+				{
+					id: "note-1",
+					author_id: "42",
+					text: "initial truncated preview",
+					created_at: "2026-07-01T09:00:00.000Z",
+				},
+			],
+			includes: { users },
+		},
+	});
+	ingestTweetPayload(db, {
+		accountId: "acct_primary",
+		source: "xurl",
+		payload: {
+			data: [
+				{
+					id: "note-1",
+					author_id: "42",
+					text: "truncated preview",
+					note_tweet: {
+						text: "full Note Tweet continuationneedle #longform",
+						entities: noteEntities,
+					},
+					created_at: "2026-07-01T09:00:00.000Z",
+				},
+			],
+			includes: { users },
+		},
+	});
+	ingestTweetPayload(db, {
+		accountId: "acct_primary",
+		source: "xurl",
+		payload: {
+			data: [
+				{
+					id: "note-1",
+					author_id: "42",
+					text: "later truncated preview",
+					entities: {
+						hashtags: [{ tag: "preview", start: 6, end: 14 }],
+					},
+					created_at: "2026-07-01T09:00:00.000Z",
+				},
+			],
+			includes: { users },
+		},
+	});
+
+	const row = db
+		.prepare(
+			"select text, entities_json, note_tweet_json from tweets where id = 'note-1'",
+		)
+		.get() as {
+		text: string;
+		entities_json: string;
+		note_tweet_json: string;
+	};
+	expect(row.text).toBe("full Note Tweet continuationneedle #longform");
+	expect(JSON.parse(row.entities_json)).toEqual(noteEntities);
+	expect(JSON.parse(row.note_tweet_json)).toEqual({
+		text: row.text,
+		entities: noteEntities,
+	});
+	expect(
+		db
+			.prepare(
+				"select count(*) as count from tweets_fts where tweets_fts match 'continuationneedle'",
+			)
+			.get(),
+	).toEqual({ count: 1 });
 });
 
 it("records observable edit chains without re-indexing a tombstoned tweet", () => {
@@ -559,15 +734,19 @@ it("merges revision components beyond SQLite's traditional variable limit", () =
 			older_revision_id, newer_revision_id, source, observed_at
 		) values (?, ?, 'test', '2026-07-01T00:00:00.000Z')
 	`);
-	for (let index = 0; index < 5_000; index += 1) {
-		const revisionId = `scale-${String(index).padStart(4, "0")}`;
-		insertRevision.run(revisionId, revisionId);
-		if (index > 0) {
-			insertEdge.run(`scale-${String(index - 1).padStart(4, "0")}`, revisionId);
+	const component = db.transaction(() => {
+		for (let index = 0; index < 5_000; index += 1) {
+			const revisionId = `scale-${String(index).padStart(4, "0")}`;
+			insertRevision.run(revisionId, revisionId);
+			if (index > 0) {
+				insertEdge.run(
+					`scale-${String(index - 1).padStart(4, "0")}`,
+					revisionId,
+				);
+			}
 		}
-	}
-
-	const component = mergeTweetRevisionChain(db, ["scale-0000"]);
+		return mergeTweetRevisionChain(db, ["scale-0000"]);
+	})();
 
 	expect(component).toHaveLength(5_000);
 	expect(
@@ -621,9 +800,7 @@ it("scopes live tombstone reconciliation to the ingested edit chains", () => {
 	db.prepare(
 		"update tweets set superseded_at = null, superseded_by_id = null where id = 'unrelated-edit-1'",
 	).run();
-	db.prepare(
-		"insert into tweets_fts (tweet_id, text) values ('unrelated-edit-1', 'scope sentinel')",
-	).run();
+	refreshSearchRows(db, "tweet", ["unrelated-edit-1"]);
 
 	ingestTweetPayload(db, {
 		accountId: "acct_primary",
@@ -677,4 +854,96 @@ it("reads both X archive edit-info variants", () => {
 			},
 		}),
 	).toEqual(["edit-1", "edit-2", "edit-3"]);
+});
+
+it("refreshes a payload's FTS rows through indexed lookups while preserving unrelated search entries", () => {
+	tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-test-"));
+	process.env.BIRDCLAW_HOME = tempRoot;
+	resetBirdclawPathsForTests();
+	resetDatabaseForTests();
+	getNativeDb();
+	const statements: string[] = [];
+	const db = new NativeSqliteDatabase(path.join(tempRoot, "birdclaw.sqlite"), {
+		onStatement: (sql) => statements.push(sql),
+	});
+	try {
+		const payload = {
+			data: Array.from({ length: 40 }, (_, index) => ({
+				id: `batch_index_${index}`,
+				author_id: "42",
+				text: `searchbefore ${index}`,
+				created_at: "2026-09-12T10:00:00Z",
+			})),
+		};
+		ingestTweetPayload(db, {
+			accountId: "acct_primary",
+			payload,
+			source: "test",
+			edgeKind: "home",
+		});
+		db.exec(
+			"insert into tweets(id,author_profile_id,text,created_at) values ('unrelated_index_sentinel','profile_me','untouched sentinel','')",
+		);
+		refreshSearchRows(db, "tweet", ["unrelated_index_sentinel"]);
+		statements.length = 0;
+		ingestTweetPayload(db, {
+			accountId: "acct_primary",
+			payload: {
+				data: payload.data.map((tweet) => ({
+					...tweet,
+					text: tweet.text.replace("searchbefore", "searchafter"),
+				})),
+				includes: {
+					tweets: [
+						{
+							...payload.data[0]!,
+							text: "included content must not override primary",
+						},
+					],
+				},
+			},
+			source: "test",
+			edgeKind: "home",
+		});
+		const deletions = statements.filter((sql) =>
+			/^\s*delete from tweets_fts/i.test(sql),
+		);
+		expect(deletions).toHaveLength(2);
+		expect(deletions.every((sql) => sql.includes("where rowid in"))).toBe(true);
+		expect(
+			db
+				.prepare(
+					"select count(*) count from tweets_fts where tweets_fts match 'searchbefore'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+		expect(
+			db
+				.prepare(
+					"select count(*) count from tweets_fts where tweets_fts match 'searchafter'",
+				)
+				.get(),
+		).toEqual({ count: 40 });
+		expect(
+			db
+				.prepare("select text from tweets_fts where tweet_id = 'batch_index_0'")
+				.all(),
+		).toEqual([{ text: "searchafter 0" }]);
+		expect(
+			db
+				.prepare(
+					"select text from tweets_fts where tweet_id = 'unrelated_index_sentinel'",
+				)
+				.get(),
+		).toEqual({ text: "untouched sentinel" });
+		statements.length = 0;
+		ingestTweetPayload(db, {
+			accountId: "acct_primary",
+			payload: { data: [] },
+			source: "test",
+		});
+		expect(statements.some((sql) => /tweets_fts/.test(sql))).toBe(false);
+	} finally {
+		db.close();
+	}
 });

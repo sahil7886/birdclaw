@@ -1,16 +1,19 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
 import {
 	keepPreviousData,
+	type InfiniteData,
+	useInfiniteQuery,
 	useMutation,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
 import { Search } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { DmWorkspace } from "#/components/DmWorkspace";
 import { FeedEmpty, FeedError, FeedLoading } from "#/components/FeedState";
 import { SyncNowButton } from "#/components/SyncNowButton";
-import { useSelectedAccountId } from "#/components/account-selection";
+import { useQueryAccount } from "#/components/account-selection";
 import { fetchJson, fetchQueryEnvelope, postAction } from "#/lib/api-client";
 import { dmQueryResponseSchema, type QueryResponse } from "#/lib/api-contracts";
 import { queryKeys } from "#/lib/query-client";
@@ -60,6 +63,10 @@ const SORTS: Array<{ value: "recent" | "followers"; label: string }> = [
 	{ value: "followers", label: "Followers" },
 ];
 
+type DmResponse = Extract<QueryResponse, { resource: "dms" }>;
+type ThreadPages = InfiniteData<DmResponse, string | null>;
+const DM_MESSAGE_PAGE_SIZE = 100;
+
 type DmInboxFilter = "all" | "accepted" | "requests";
 
 const INBOX_FILTERS: Array<{ value: DmInboxFilter; label: string }> = [
@@ -92,10 +99,15 @@ export function DmsRouteView({
 	onSearchChange?: RouteSearchChange<DmsRouteSearch>;
 } = {}) {
 	const queryClient = useQueryClient();
-	const [localSearch, setLocalSearch] = useState(() => validateDmsSearch({}));
-	const searchState = controlledSearch ?? localSearch;
-	const updateSearch: RouteSearchChange<DmsRouteSearch> = (next, options) =>
-		onSearchChange ? onSearchChange(next, options) : setLocalSearch(next);
+	const { searchState, updateSearch, textInput } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateDmsSearch,
+	);
+	const selectConversation = useCallback(
+		(conversation: string) => updateSearch({ ...searchState, conversation }),
+		[searchState, updateSearch],
+	);
 	const inboxFilter = searchState.inbox;
 	const replyFilter = searchState.reply;
 	const minFollowers = searchState.minFollowers;
@@ -109,7 +121,8 @@ export function DmsRouteView({
 		queryFn: ({ signal }) => fetchQueryEnvelope({ signal }),
 	});
 	const meta = statusQuery.data ?? null;
-	const selectedAccountId = useSelectedAccountId(meta?.accounts);
+	const { selectedAccountId, accountSelectionSettled } =
+		useQueryAccount(statusQuery);
 	const debouncedSearch = useDebouncedValue(search, 180);
 	const dmsQueryKey = [
 		...queryKeys.dms,
@@ -121,14 +134,31 @@ export function DmsRouteView({
 			sort,
 			search: debouncedSearch,
 			selectedAccountId: selectedAccountId ?? null,
-			selectedConversationId: selectedConversationId ?? null,
 		},
 	] as const;
 	const dmsQuery = useQuery({
 		queryKey: dmsQueryKey,
+		enabled: accountSelectionSettled,
 		queryFn: ({ signal }) => {
 			const url = new URL("/api/query", window.location.origin);
 			url.searchParams.set("resource", "dms");
+			const cachedThread =
+				selectedConversationId &&
+				queryClient
+					.getQueriesData<ThreadPages>({ queryKey: queryKeys.dmThreads })
+					.some(([, data]) => {
+						const thread = data?.pages[0]?.selectedConversation;
+						return (
+							thread?.conversation.id === selectedConversationId &&
+							(inboxFilter === "requests" ||
+								!selectedAccountId ||
+								thread.conversation.accountId === selectedAccountId)
+						);
+					});
+			if (cachedThread) url.searchParams.set("view", "list");
+			else url.searchParams.set("messageLimit", String(DM_MESSAGE_PAGE_SIZE));
+			if (!cachedThread && selectedConversationId)
+				url.searchParams.set("conversationId", selectedConversationId);
 			url.searchParams.set("inbox", inboxFilter);
 			url.searchParams.set("replyFilter", replyFilter);
 			url.searchParams.set("sort", sort);
@@ -140,9 +170,6 @@ export function DmsRouteView({
 			}
 			if (selectedAccountId && inboxFilter !== "requests") {
 				url.searchParams.set("account", selectedAccountId);
-			}
-			if (selectedConversationId) {
-				url.searchParams.set("conversationId", selectedConversationId);
 			}
 			if (debouncedSearch.trim()) {
 				url.searchParams.set("search", debouncedSearch.trim());
@@ -160,33 +187,131 @@ export function DmsRouteView({
 	const queryData = dmsQuery.data;
 	const dmsData = queryData?.resource === "dms" ? queryData : null;
 	const items: DmConversationItem[] = dmsData?.items ?? [];
-	const messages = dmsData?.selectedConversation?.messages ?? [];
-	const loadedConversationId = dmsData?.selectedConversation?.conversation.id;
+	const selectedConversation =
+		items.find((item) => item.id === selectedConversationId) ??
+		items[0] ??
+		null;
+	const resolvedConversationId = selectedConversation?.id;
+	const threadQueryKey = [
+		...queryKeys.dmThreads,
+		{
+			account: selectedConversation?.accountId ?? null,
+			conversationId: resolvedConversationId ?? null,
+		},
+	] as const;
+	const threadQuery = useInfiniteQuery({
+		queryKey: threadQueryKey,
+		initialPageParam: null as string | null,
+		getNextPageParam: (page) =>
+			page.selectedConversation?.nextCursor ?? undefined,
+		initialData: (): ThreadPages | undefined => {
+			const thread = dmsData?.selectedConversation;
+			return thread &&
+				thread.conversation.id === resolvedConversationId &&
+				thread.conversation.accountId === selectedConversation?.accountId
+				? {
+						pages: [
+							{
+								resource: "dms" as const,
+								items: [],
+								selectedConversation: thread,
+							},
+						],
+						pageParams: [null],
+					}
+				: undefined;
+		},
+		initialDataUpdatedAt: dmsQuery.dataUpdatedAt,
+		enabled:
+			accountSelectionSettled &&
+			!dmsQuery.isPlaceholderData &&
+			Boolean(selectedConversation),
+		queryFn: async ({ signal, pageParam }) => {
+			const url = new URL("/api/query", window.location.origin);
+			url.searchParams.set("resource", "dms");
+			url.searchParams.set("view", "conversation");
+			url.searchParams.set("messageLimit", String(DM_MESSAGE_PAGE_SIZE));
+			if (pageParam) url.searchParams.set("before", pageParam);
+			url.searchParams.set("conversationId", selectedConversation!.id);
+			url.searchParams.set("account", selectedConversation!.accountId);
+			const result = await fetchJson(
+				url,
+				{ signal },
+				dmQueryResponseSchema,
+				"Conversation unavailable",
+			);
+			if (!result.selectedConversation)
+				throw new Error("Conversation unavailable");
+			return result;
+		},
+		staleTime: 5 * 60_000,
+	});
+	const messages = useMemo(() => {
+		const seen = new Set<string>();
+		return [...(threadQuery.data?.pages ?? [])]
+			.reverse()
+			.flatMap((page) => page.selectedConversation?.messages ?? [])
+			.filter((message) => {
+				if (seen.has(message.id)) return false;
+				seen.add(message.id);
+				return true;
+			});
+	}, [threadQuery.data]);
 
 	useEffect(() => {
-		if (!dmsQuery.data) return;
-		const nextSelected = loadedConversationId ?? items[0]?.id;
-		const resolved =
-			selectedConversationId &&
-			items.some((conversation) => conversation.id === selectedConversationId)
-				? selectedConversationId
-				: nextSelected;
-		if (resolved && resolved !== selectedConversationId) {
+		const thread = dmsData?.selectedConversation;
+		if (
+			dmsQuery.isPlaceholderData ||
+			!thread ||
+			thread.conversation.id !== resolvedConversationId ||
+			thread.conversation.accountId !== selectedConversation?.accountId
+		)
+			return;
+		if (
+			(queryClient.getQueryState(threadQueryKey)?.dataUpdatedAt ?? 0) <
+			dmsQuery.dataUpdatedAt
+		) {
+			queryClient.setQueryData<ThreadPages>(
+				threadQueryKey,
+				{
+					pages: [{ resource: "dms", items: [], selectedConversation: thread }],
+					pageParams: [null],
+				},
+				{ updatedAt: dmsQuery.dataUpdatedAt },
+			);
+		}
+	}, [
+		dmsData,
+		dmsQuery.isPlaceholderData,
+		dmsQuery.dataUpdatedAt,
+		resolvedConversationId,
+		selectedConversation?.accountId,
+	]);
+
+	useEffect(() => {
+		if (!dmsQuery.data || dmsQuery.isPlaceholderData) return;
+		if (
+			resolvedConversationId &&
+			resolvedConversationId !== selectedConversationId
+		) {
 			updateSearch(
-				{ ...searchState, conversation: resolved },
+				{ ...searchState, conversation: resolvedConversationId },
 				{ replace: true },
 			);
 		}
-	}, [dmsQuery.data, items, loadedConversationId]);
-
-	const selectedConversation =
-		items.find((item) => item.id === selectedConversationId) ?? null;
-	const switchingConversation = Boolean(
-		!dmsQuery.isError &&
-		selectedConversationId &&
-		loadedConversationId &&
-		selectedConversationId !== loadedConversationId,
+	}, [
+		dmsQuery.data,
+		dmsQuery.isPlaceholderData,
+		resolvedConversationId,
+		selectedConversationId,
+	]);
+	const staleAccount = Boolean(
+		inboxFilter !== "requests" &&
+		selectedAccountId &&
+		items.some((item) => item.accountId !== selectedAccountId),
 	);
+	const switchingConversation =
+		staleAccount || Boolean(selectedConversation && threadQuery.isPending);
 
 	const subtitle = useMemo(() => {
 		if (!meta) return "Loading direct messages...";
@@ -201,10 +326,20 @@ export function DmsRouteView({
 			text: string;
 		}) => postAction({ kind: "replyDm", conversationId, text }),
 		onMutate: async ({ conversationId, text }) => {
-			await queryClient.cancelQueries({ queryKey: dmsQueryKey });
+			await Promise.all([
+				queryClient.cancelQueries({ queryKey: dmsQueryKey }),
+				queryClient.cancelQueries({ queryKey: threadQueryKey }),
+			]);
 			const previous = queryClient.getQueryData<QueryResponse>(dmsQueryKey);
+			const previousThread =
+				queryClient.getQueryData<ThreadPages>(threadQueryKey);
 			if (!previous || previous.resource !== "dms" || !selectedConversation) {
-				return { previous };
+				return {
+					previous,
+					previousThread,
+					listKey: dmsQueryKey,
+					threadKey: threadQueryKey,
+				};
 			}
 			const now = new Date().toISOString();
 			const accountRecord = meta?.accounts.find(
@@ -244,26 +379,43 @@ export function DmsRouteView({
 							}
 						: item,
 				),
-				selectedConversation: previous.selectedConversation
-					? {
-							...previous.selectedConversation,
-							messages: [
-								...previous.selectedConversation.messages,
-								optimisticMessage,
-							],
-						}
-					: previous.selectedConversation,
 			});
-			return { previous };
+			if (previousThread?.pages[0]?.selectedConversation) {
+				queryClient.setQueryData<ThreadPages>(threadQueryKey, {
+					...previousThread,
+					pages: previousThread.pages.map((page, index) =>
+						index === 0 && page.selectedConversation
+							? {
+									...page,
+									selectedConversation: {
+										...page.selectedConversation,
+										messages: [
+											...page.selectedConversation.messages,
+											optimisticMessage,
+										],
+									},
+								}
+							: page,
+					),
+				});
+			}
+			return {
+				previous,
+				previousThread,
+				listKey: dmsQueryKey,
+				threadKey: threadQueryKey,
+			};
 		},
 		onError: (_error, _variables, context) => {
-			if (context?.previous) {
-				queryClient.setQueryData(dmsQueryKey, context.previous);
-			}
+			if (context?.previous)
+				queryClient.setQueryData(context.listKey, context.previous);
+			if (context?.previousThread)
+				queryClient.setQueryData(context.threadKey, context.previousThread);
 		},
 		onSettled: () =>
 			Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.dms }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.dmThreads }),
 				queryClient.invalidateQueries({ queryKey: queryKeys.status }),
 			]),
 	});
@@ -283,13 +435,17 @@ export function DmsRouteView({
 	function refreshLocalView() {
 		void Promise.all([
 			queryClient.invalidateQueries({ queryKey: queryKeys.dms }),
+			queryClient.invalidateQueries({ queryKey: queryKeys.dmThreads }),
 			queryClient.invalidateQueries({ queryKey: queryKeys.status }),
 		]);
 	}
 	const loading = dmsQuery.isPending;
-	const error = dmsQuery.error
-		? dmsQuery.error instanceof Error
-			? dmsQuery.error.message
+	const queryError =
+		dmsQuery.error ??
+		(threadQuery.isFetchNextPageError ? null : threadQuery.error);
+	const error = queryError
+		? queryError instanceof Error
+			? queryError.message
 			: "Messages unavailable"
 		: null;
 	const replyError = replyMutation.error
@@ -341,14 +497,8 @@ export function DmsRouteView({
 						<Search className={searchFieldIconClass} strokeWidth={2} />
 						<input
 							className={searchFieldInputClass}
-							onChange={(event) =>
-								updateSearch(
-									{ ...searchState, q: event.target.value },
-									{ replace: true },
-								)
-							}
+							{...textInput("q")}
 							placeholder="Search DMs"
-							value={search}
 						/>
 					</label>
 					<label className={cx(filterNumberFieldClass, "w-[156px]")}>
@@ -358,17 +508,8 @@ export function DmsRouteView({
 						<input
 							className="min-w-0 flex-1 border-0 bg-transparent text-right text-[14px] text-[var(--ink)] outline-none placeholder:text-[var(--ink-soft)]"
 							inputMode="numeric"
-							onChange={(event) =>
-								updateSearch(
-									{
-										...searchState,
-										minFollowers: event.target.value,
-									},
-									{ replace: true },
-								)
-							}
+							{...textInput("minFollowers")}
 							placeholder="Any"
-							value={minFollowers}
 						/>
 					</label>
 					<label className={cx(filterNumberFieldClass, "w-[132px]")}>
@@ -378,17 +519,8 @@ export function DmsRouteView({
 						<input
 							className="min-w-0 flex-1 border-0 bg-transparent text-right text-[14px] text-[var(--ink)] outline-none placeholder:text-[var(--ink-soft)]"
 							inputMode="numeric"
-							onChange={(event) =>
-								updateSearch(
-									{
-										...searchState,
-										minInfluence: event.target.value,
-									},
-									{ replace: true },
-								)
-							}
+							{...textInput("minInfluence")}
 							placeholder="Any"
-							value={minInfluenceScore}
 						/>
 					</label>
 					<div className={segmentedClass}>
@@ -447,7 +579,12 @@ export function DmsRouteView({
 					action={
 						<button
 							className="rounded-full bg-[var(--accent)] px-4 py-1.5 text-[14px] font-bold text-white"
-							onClick={() => void dmsQuery.refetch()}
+							onClick={() =>
+								void Promise.all([
+									dmsQuery.refetch(),
+									...(selectedConversation ? [threadQuery.refetch()] : []),
+								])
+							}
 							type="button"
 						>
 							Retry
@@ -466,12 +603,18 @@ export function DmsRouteView({
 					conversations={items}
 					onReplyDraftChange={setReplyDraft}
 					onReplySend={replyToConversation}
-					onSelectConversation={(conversation) =>
-						updateSearch({ ...searchState, conversation })
-					}
+					onSelectConversation={selectConversation}
 					replyDraft={replyDraft}
 					selectedConversation={selectedConversation}
 					selectedMessages={messages}
+					hasEarlier={threadQuery.hasNextPage}
+					loadingEarlier={threadQuery.isFetchingNextPage}
+					onLoadEarlier={() => void threadQuery.fetchNextPage()}
+					earlierError={
+						threadQuery.isFetchNextPageError
+							? "Could not load earlier messages. Try again."
+							: undefined
+					}
 				/>
 			)}
 		</>

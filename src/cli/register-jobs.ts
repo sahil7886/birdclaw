@@ -33,7 +33,11 @@ export function registerJobCommands({
 			"--steps <steps>",
 			"Comma list: timeline,mentions,mention-threads,likes,bookmarks,dms",
 		)
-		.option("--mode <mode>", "auto, xurl, or bird for likes/bookmarks", "auto")
+		.option(
+			"--mode <mode>",
+			"auto, xurl, or bird; mention threads use xurl",
+			"auto",
+		)
 		.option("--limit <n>", "Per-page/result limit", "100")
 		.option("--max-pages <n>", "Stop after N pages", "3")
 		.option("--cache-ttl <seconds>", "Live-cache freshness window", "120")
@@ -81,7 +85,11 @@ export function registerJobCommands({
 			"--steps <steps>",
 			"Comma list: timeline,mentions,mention-threads,likes,bookmarks,dms",
 		)
-		.option("--mode <mode>", "auto, xurl, or bird for likes/bookmarks", "auto")
+		.option(
+			"--mode <mode>",
+			"auto, xurl, or bird; mention threads use xurl",
+			"auto",
+		)
 		.option("--limit <n>", "Per-page/result limit", "100")
 		.option("--max-pages <n>", "Stop after N pages", "3")
 		.option("--cache-ttl <seconds>", "Live-cache freshness window", "120")
@@ -102,7 +110,7 @@ export function registerJobCommands({
 				options.intervalSeconds,
 				"--interval-seconds",
 			);
-			if (intervalSeconds === undefined) return;
+
 			const result = await installAccountSyncLaunchAgent({
 				label: options.label,
 				intervalSeconds,
@@ -189,7 +197,7 @@ export function registerJobCommands({
 				options.intervalSeconds,
 				"--interval-seconds",
 			);
-			if (intervalSeconds === undefined) return;
+
 			const result = await installBookmarkSyncLaunchAgent({
 				account: options.account,
 				label: options.label,

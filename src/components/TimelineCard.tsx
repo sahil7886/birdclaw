@@ -8,6 +8,7 @@ import {
 	Repeat2,
 	UserSearch,
 } from "lucide-react";
+import { memo, useRef } from "react";
 import { formatCompactNumber } from "#/lib/present";
 import {
 	isTweetArticleUrlEntity,
@@ -21,6 +22,7 @@ import type {
 	TweetUrlEntity,
 } from "#/lib/types";
 import { useConversationSurface } from "#/lib/conversation-surface";
+import { useDeploymentMode } from "#/lib/deployment-mode";
 import {
 	cx,
 	embeddedCardClass,
@@ -42,8 +44,10 @@ import {
 } from "#/lib/ui";
 import { AvatarChip } from "./AvatarChip";
 import { ConversationThread } from "./ConversationThread";
+import { TweetPermalinkLink } from "./TweetPermalinkLink";
 import { EmbeddedTweetCard } from "./EmbeddedTweetCard";
 import { LinkPreviewCard } from "./LinkPreviewCard";
+import { OpenTweetLink } from "./OpenTweetLink";
 import { ProfilePreview } from "./ProfilePreview";
 import { SmartTimestamp } from "./SmartTimestamp";
 import { TweetArticleCard } from "./TweetArticleCard";
@@ -229,7 +233,9 @@ function getVisibleUrlCards(
 function isInteractiveTarget(target: EventTarget | null) {
 	return (
 		target instanceof Element &&
-		Boolean(target.closest("a,button,input,textarea,select,[role='button']"))
+		Boolean(
+			target.closest("a,button,video,input,textarea,select,[role='button']"),
+		)
 	);
 }
 
@@ -250,11 +256,12 @@ function TweetPresentation({
 		<>
 			<TweetRichText
 				className={feedRowTextClass}
+				collapsible={Boolean(tweet.noteTweet)}
 				entities={tweet.entities}
 				hiddenUrlRanges={hiddenUrlRanges}
 				text={tweet.text}
 			/>
-			<TweetMediaGrid items={tweet.media} />
+			<TweetMediaGrid items={tweet.media} tweetId={tweet.id} />
 			{tweet.entities.article ? (
 				<TweetArticleCard article={tweet.entities.article} />
 			) : null}
@@ -279,7 +286,7 @@ function TweetPresentation({
 	);
 }
 
-export function TimelineCard({
+export const TimelineCard = memo(function TimelineCard({
 	item,
 	onReply,
 	showReplyControls = true,
@@ -288,8 +295,12 @@ export function TimelineCard({
 	onReply: (tweetId: string) => void;
 	showReplyControls?: boolean;
 }) {
+	const { readOnly } = useDeploymentMode();
 	const canReply =
-		showReplyControls && item.kind !== "like" && item.kind !== "bookmark";
+		!readOnly &&
+		showReplyControls &&
+		item.kind !== "like" &&
+		item.kind !== "bookmark";
 	const displayTweet = item.retweetedTweet ?? item;
 	const displayTweetId = displayTweet.id;
 	const interactionTweetId =
@@ -298,6 +309,9 @@ export function TimelineCard({
 			: displayTweetId;
 	const displayAuthor = displayTweet.author;
 	const conversation = useConversationSurface(item.id, interactionTweetId);
+	const pointerType = useRef("");
+	const noThreads =
+		conversation.status === "ready" && conversation.items.length <= 1;
 	const visibleEntities = getVisibleEntities(
 		displayTweet.entities,
 		displayTweet.media,
@@ -333,21 +347,40 @@ export function TimelineCard({
 		<article
 			className={cx(
 				feedRowClass,
-				"cursor-default [content-visibility:auto] [contain-intrinsic-size:auto_280px]",
+				"[content-visibility:auto] [contain-intrinsic-size:auto_280px]",
+				!noThreads && "cursor-pointer",
 			)}
 			data-perf="timeline-card"
 			onFocus={conversation.prefetch}
 			onMouseEnter={conversation.prefetch}
+			onPointerDown={(event) => {
+				pointerType.current = event.pointerType;
+			}}
+			onPointerCancel={() => {
+				pointerType.current = "";
+			}}
 			onClick={(event) => {
-				// Plain-text taps only ever dismiss: close ANY open thread
-				// surface in this feed scope, never open one. The Thread
-				// button is the explicit opener. Closing only this card's
-				// own surface left threads opened from other rows stuck.
+				// Some browsers still emit MouseEvent clicks after touch pointers.
+				const inputType =
+					"pointerType" in event.nativeEvent
+						? event.nativeEvent.pointerType
+						: event.detail === 0
+							? ""
+							: pointerType.current;
+				pointerType.current = "";
 				if (isInteractiveTarget(event.target)) return;
-				if (conversation.isOpen) {
-					conversation.toggle();
-				} else {
+				const selection = window.getSelection();
+				if (
+					selection &&
+					!selection.isCollapsed &&
+					(event.currentTarget.contains(selection.anchorNode) ||
+						event.currentTarget.contains(selection.focusNode))
+				)
+					return;
+				if (inputType === "touch") {
 					conversation.closeAny();
+				} else if (!noThreads) {
+					conversation.toggle();
 				}
 			}}
 		>
@@ -427,29 +460,45 @@ export function TimelineCard({
 					visibleUrlCards={visibleUrlCards}
 				/>
 				<footer className={feedRowActionsClass}>
-					<div className="flex items-center gap-3 text-[13px] text-[var(--ink-soft)]">
-						<button
-							aria-expanded={conversation.isOpen}
-							aria-label={
-								conversation.isOpen ? "Hide conversation" : "Show conversation"
-							}
-							className={feedActionButtonClass}
-							onClick={(event) => {
-								event.stopPropagation();
-								conversation.toggle();
-							}}
-							type="button"
-						>
-							<span className={feedActionIconWrapClass}>
-								<MessageCircle
-									className={feedActionIconClass}
-									strokeWidth={1.7}
-								/>
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-[var(--ink-soft)]">
+						{noThreads ? (
+							<span className="inline-flex items-center gap-1 px-2 py-1 text-[13px]">
+								<span className={feedActionIconWrapClass}>
+									<MessageCircle
+										className={feedActionIconClass}
+										strokeWidth={1.7}
+									/>
+								</span>
+								no threads
 							</span>
-							<span className="text-[13px]">
-								{conversation.isOpen ? "Hide thread" : "Thread"}
-							</span>
-						</button>
+						) : (
+							<button
+								aria-expanded={conversation.isOpen}
+								aria-label={
+									conversation.isOpen
+										? "Hide conversation"
+										: "Show conversation"
+								}
+								className={feedActionButtonClass}
+								onClick={(event) => {
+									event.stopPropagation();
+									conversation.toggle();
+								}}
+								type="button"
+							>
+								<span className={feedActionIconWrapClass}>
+									<MessageCircle
+										className={feedActionIconClass}
+										strokeWidth={1.7}
+									/>
+								</span>
+								<span className="text-[13px]">
+									{conversation.isOpen ? "Hide thread" : "Thread"}
+								</span>
+							</button>
+						)}
+						<OpenTweetLink tweetId={interactionTweetId} />
+						<TweetPermalinkLink tweetId={interactionTweetId} />
 						{canReply ? (
 							<button
 								className={feedActionButtonClass}
@@ -470,6 +519,7 @@ export function TimelineCard({
 							</button>
 						) : null}
 						<a
+							hidden={readOnly}
 							aria-label={`Analyse @${displayAuthor.handle}`}
 							className={feedActionButtonClass}
 							href={`/profiles/${encodeURIComponent(displayAuthor.handle)}`}
@@ -524,7 +574,7 @@ export function TimelineCard({
 						) : null}
 					</div>
 				</footer>
-				{conversation.isOpen ? (
+				{conversation.isOpen && !noThreads ? (
 					<ConversationThread
 						anchorId={interactionTweetId}
 						error={conversation.error}
@@ -535,4 +585,4 @@ export function TimelineCard({
 			</div>
 		</article>
 	);
-}
+});

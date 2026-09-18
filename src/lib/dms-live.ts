@@ -1,18 +1,18 @@
 import { Effect } from "effect";
 import type { Database } from "./sqlite";
+import { refreshSearchRows } from "./search-index";
 import {
-	type BirdDmConversation,
+	type BirdDmsResponse,
 	type BirdDmEvent,
 	type BirdDmUser,
 	listDirectMessagesViaBirdEffect,
 } from "./bird";
 import { verifyBirdAccountMatchesEffect } from "./bird-account";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, tryPromise } from "./effect-runtime";
 import { getProvenSelectedAccountLegacyProfileIds } from "./profile-identity";
 import {
 	assertLiveAccountMatches,
-	parseLiveSyncMode,
 	parseOptionalPageDelayMs,
 	parseOptionalMaxPages,
 	parseLivePageSize,
@@ -32,12 +32,30 @@ import {
 	listDirectMessageEventsViaXurlEffect,
 	lookupAuthenticatedOAuth2UserEffect,
 } from "./xurl";
+import { hasXWebCredentials } from "./x-web";
+import { readWebDirectMessages } from "./x-web-dms";
 
 export const DEFAULT_DMS_CACHE_TTL_MS = 2 * 60_000;
 const PREVIEW_MESSAGE_ID_PREFIX = "preview:";
 const XURL_DMS_MAX_RESULTS = 100;
 
-export type DirectMessagesSyncMode = LiveSyncMode;
+export type DirectMessagesSyncMode = LiveSyncMode | "web";
+
+export function parseDirectMessagesSyncMode(
+	value: unknown,
+): DirectMessagesSyncMode {
+	if (value === undefined) return "auto";
+	if (
+		value === "auto" ||
+		value === "bird" ||
+		value === "xurl" ||
+		value === "web"
+	)
+		return value;
+	throw new Error("--mode must be auto, bird, web, or xurl");
+}
+
+type DirectMessagesPayload = Pick<BirdDmsResponse, "conversations" | "events">;
 
 export interface SyncDirectMessagesViaCachedBirdOptions {
 	account?: string;
@@ -55,17 +73,6 @@ function makePreviewMessageId(conversationId: string): string {
 	return `${PREVIEW_MESSAGE_ID_PREFIX}${conversationId}`;
 }
 
-function deleteDmFtsRows(db: Database, messageIds: string[]) {
-	const chunkSize = 500;
-	for (let index = 0; index < messageIds.length; index += chunkSize) {
-		const chunk = messageIds.slice(index, index + chunkSize);
-		if (chunk.length === 0) continue;
-		db.prepare(
-			`delete from dm_fts where message_id in (${chunk.map(() => "?").join(",")})`,
-		).run(...chunk);
-	}
-}
-
 function toIsoTimestamp(value?: string) {
 	if (!value) {
 		return new Date().toISOString();
@@ -75,10 +82,7 @@ function toIsoTimestamp(value?: string) {
 }
 
 function collectUsers(
-	payload: {
-		conversations: BirdDmConversation[];
-		events: BirdDmEvent[];
-	},
+	payload: DirectMessagesPayload,
 	accountExternalUserId?: string,
 ) {
 	const users = new Map<string, BirdDmUser>();
@@ -181,10 +185,7 @@ function conversationIdReferencesExternalUserId(
 }
 
 function payloadReferencesExternalUserId(
-	payload: {
-		conversations: BirdDmConversation[];
-		events: BirdDmEvent[];
-	},
+	payload: DirectMessagesPayload,
 	externalUserId: string,
 ) {
 	for (const conversation of payload.conversations) {
@@ -244,10 +245,7 @@ function mergeDirectMessagesIntoLocalStore(
 	accountId: string,
 	accountUsername: string,
 	accountExternalUserId: string | undefined,
-	payload: {
-		conversations: BirdDmConversation[];
-		events: BirdDmEvent[];
-	},
+	payload: DirectMessagesPayload,
 ) {
 	const users = collectUsers(payload, accountExternalUserId);
 	const localExternalUserId = getLocalExternalUserId(
@@ -360,9 +358,6 @@ function mergeDirectMessagesIntoLocalStore(
       direction = excluded.direction,
       media_count = excluded.media_count
   `);
-	const insertFts = db.prepare(
-		"insert into dm_fts (message_id, text) values (?, ?)",
-	);
 	const deleteMessage = db.prepare("delete from dm_messages where id = ?");
 	const ftsMessageIdsToReplace = new Set<string>();
 	for (const conversation of payload.conversations) {
@@ -393,9 +388,6 @@ function mergeDirectMessagesIntoLocalStore(
 	}
 
 	db.transaction(() => {
-		deleteDmFtsRows(db, [...ftsMessageIdsToReplace]);
-		const ftsTextByMessageId = new Map<string, string>();
-
 		for (const conversation of payload.conversations) {
 			const events = eventsByConversation.get(conversation.id) ?? [];
 			if (events.length === 0 && !conversation.lastMessagePreview) {
@@ -452,10 +444,6 @@ function mergeDirectMessagesIntoLocalStore(
 					lastMessageAt,
 					latestInbound ? "inbound" : "outbound",
 				);
-				ftsTextByMessageId.set(
-					previewMessageId,
-					conversation.lastMessagePreview,
-				);
 				continue;
 			}
 
@@ -484,13 +472,10 @@ function mergeDirectMessagesIntoLocalStore(
 					toIsoTimestamp(event.createdAt),
 					direction,
 				);
-				ftsTextByMessageId.set(event.id, event.text);
 			}
 		}
 
-		for (const [messageId, text] of ftsTextByMessageId) {
-			insertFts.run(messageId, text);
-		}
+		refreshSearchRows(db, "dm", [...ftsMessageIdsToReplace]);
 	})();
 }
 
@@ -537,7 +522,7 @@ function adaptXurlDmEventsToBirdPayload({
 	payload: XurlDmEventsResponse;
 	localExternalUserId: string;
 	accountUsername: string;
-}): { conversations: BirdDmConversation[]; events: BirdDmEvent[] } {
+}): DirectMessagesPayload {
 	const users = new Map<string, BirdDmUser>();
 	const addUser = (user?: BirdDmUser) => {
 		if (!user?.id) return;
@@ -698,7 +683,7 @@ export function syncDirectMessagesViaCachedBirdEffect({
 }: SyncDirectMessagesViaCachedBirdOptions = {}): Effect.Effect<
 	{
 		ok: true;
-		source: "bird" | "cache" | "xurl";
+		source: "bird" | "cache" | "xurl" | "web";
 		accountId: string;
 		conversations: number;
 		messages: number;
@@ -706,7 +691,7 @@ export function syncDirectMessagesViaCachedBirdEffect({
 	unknown
 > {
 	return Effect.gen(function* () {
-		const parsedMode = parseLiveSyncMode(mode, "bird");
+		const parsedMode = parseDirectMessagesSyncMode(mode);
 		const parsedMaxPages = parseOptionalMaxPages(maxPages, { allowZero: true });
 		const parsedPageDelayMs = parseOptionalPageDelayMs(
 			pageDelayMs,
@@ -717,7 +702,7 @@ export function syncDirectMessagesViaCachedBirdEffect({
 		});
 		if (inbox === "requests" && parsedMode === "xurl") {
 			throw new Error(
-				"xurl DM mode cannot read the message-request inbox or accept/reject state; use --mode bird",
+				"xurl DM mode cannot read the message-request inbox or accept/reject state; use --mode web with AUTH_TOKEN and CT0",
 			);
 		}
 		const db = getNativeDb();
@@ -725,12 +710,8 @@ export function syncDirectMessagesViaCachedBirdEffect({
 		const pageKey = allPages
 			? "all-pages"
 			: `max-pages:${String(maxPages ?? 0)}`;
-		const cacheMode = parsedMode === "auto" ? "auto" : parsedMode;
-		const cacheKey = `dms:${cacheMode}:${resolvedAccount.accountId}:${String(limit)}:${inbox}:${pageKey}`;
-		const cache = inspectSyncCache<{
-			conversations: BirdDmConversation[];
-			events: BirdDmEvent[];
-		}>(
+		const cacheKey = `dms:${parsedMode}:${resolvedAccount.accountId}:${String(limit)}:${inbox}:${pageKey}`;
+		const cache = inspectSyncCache<DirectMessagesPayload>(
 			cacheKey,
 			{ ttlMs: cacheTtlMs, defaultTtlMs: DEFAULT_DMS_CACHE_TTL_MS },
 			db,
@@ -739,17 +720,57 @@ export function syncDirectMessagesViaCachedBirdEffect({
 
 		const cacheHit = !refresh && cached && cache.fresh;
 		let accountExternalUserId = resolvedAccount.externalUserId;
-		let payload:
-			| {
-					conversations: BirdDmConversation[];
-					events: BirdDmEvent[];
-			  }
-			| undefined;
-		let source: "bird" | "xurl" | undefined;
+		let payload: DirectMessagesPayload | undefined;
+		let source: "bird" | "xurl" | "web" | undefined;
 		if (cacheHit) {
 			payload = cached.value;
 		} else {
+			const failures: string[] = [];
+			let nativeAttempted = false;
+			const nativeRead = Effect.gen(function* () {
+				nativeAttempted = true;
+				const native = yield* tryPromise(() =>
+					readWebDirectMessages({
+						account: {
+							...resolvedAccount,
+							externalUserId: accountExternalUserId,
+						},
+						limit,
+						inbox,
+						maxPages: parsedMaxPages,
+						allPages,
+						pageDelayMs: parsedPageDelayMs,
+					}),
+				);
+				accountExternalUserId ??= native.authenticated.id;
+				if (!resolvedAccount.externalUserId)
+					persistAccountExternalUserId(
+						db,
+						resolvedAccount.accountId,
+						native.authenticated.id,
+					);
+				payload = native.payload;
+				source = "web";
+			}).pipe(
+				Effect.catchAll((error) => {
+					if (parsedMode === "web") return Effect.fail(error);
+					failures.push(
+						`web: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					return Effect.void;
+				}),
+			);
+			if (
+				parsedMode === "web" ||
+				(parsedMode === "auto" &&
+					hasXWebCredentials() &&
+					(inbox === "requests" ||
+						(inbox === "all" &&
+							(account === undefined || resolvedAccount.isDefault))))
+			)
+				yield* nativeRead;
 			const tryXurl =
+				!payload &&
 				(parsedMode === "xurl" || parsedMode === "auto") &&
 				inbox !== "requests";
 			if (tryXurl) {
@@ -799,6 +820,9 @@ export function syncDirectMessagesViaCachedBirdEffect({
 				}).pipe(
 					Effect.catchAll((error) => {
 						if (parsedMode === "xurl") return Effect.fail(error);
+						failures.push(
+							`xurl: ${error instanceof Error ? error.message : String(error)}`,
+						);
 						return Effect.succeed(undefined);
 					}),
 				);
@@ -817,27 +841,51 @@ export function syncDirectMessagesViaCachedBirdEffect({
 					source = "xurl";
 				}
 			}
+			if (
+				!payload &&
+				!nativeAttempted &&
+				parsedMode === "auto" &&
+				hasXWebCredentials()
+			)
+				yield* nativeRead;
 			if (!payload) {
-				const authenticated =
-					yield* verifyBirdAccountMatchesEffect(resolvedAccount);
-				accountExternalUserId ??= authenticated.id;
-				if (!resolvedAccount.externalUserId && accountExternalUserId) {
-					persistAccountExternalUserId(
-						db,
-						resolvedAccount.accountId,
-						accountExternalUserId,
-					);
-				}
-				payload = yield* listDirectMessagesViaBirdEffect({
-					maxResults: limit,
-					...(inbox !== "all" ? { inbox } : {}),
-					...(parsedMaxPages !== undefined ? { maxPages: parsedMaxPages } : {}),
-					...(allPages ? { allPages } : {}),
-					...(parsedPageDelayMs !== undefined
-						? { pageDelayMs: parsedPageDelayMs }
-						: {}),
-				});
-				source = "bird";
+				yield* Effect.gen(function* () {
+					const authenticated = yield* verifyBirdAccountMatchesEffect({
+						...resolvedAccount,
+						externalUserId: accountExternalUserId,
+					});
+					accountExternalUserId ??= authenticated.id;
+					if (!resolvedAccount.externalUserId && accountExternalUserId) {
+						persistAccountExternalUserId(
+							db,
+							resolvedAccount.accountId,
+							accountExternalUserId,
+						);
+					}
+					payload = yield* listDirectMessagesViaBirdEffect({
+						maxResults: limit,
+						...(inbox !== "all" ? { inbox } : {}),
+						...(parsedMaxPages !== undefined
+							? { maxPages: parsedMaxPages }
+							: {}),
+						...(allPages ? { allPages } : {}),
+						...(parsedPageDelayMs !== undefined
+							? { pageDelayMs: parsedPageDelayMs }
+							: {}),
+					});
+					source = "bird";
+				}).pipe(
+					Effect.mapError((error) =>
+						parsedMode === "bird"
+							? error
+							: new Error(
+									[
+										...failures,
+										`bird: ${error instanceof Error ? error.message : String(error)}`,
+									].join("\n"),
+								),
+					),
+				);
 			}
 		}
 		if (!payload) {

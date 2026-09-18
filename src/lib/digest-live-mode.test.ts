@@ -27,11 +27,14 @@ describe("digest live mode", () => {
 		expect(parseDigestLiveSyncMode(undefined)).toBe("xurl");
 	});
 
-	it("honors a valid env default", () => {
-		process.env.BIRDCLAW_DIGEST_LIVE_MODE = "bird";
-		expect(defaultDigestLiveSyncMode()).toBe("bird");
-		expect(parseDigestLiveSyncMode(null)).toBe("bird");
-	});
+	it.each(["auto", "bird", "xurl"])(
+		"honors and normalizes the %s env default",
+		(mode) => {
+			process.env.BIRDCLAW_DIGEST_LIVE_MODE = ` ${mode.toUpperCase()} `;
+			expect(defaultDigestLiveSyncMode()).toBe(mode);
+			expect(parseDigestLiveSyncMode(null)).toBe(mode);
+		},
+	);
 
 	it("falls back to xurl for an invalid env value", () => {
 		process.env.BIRDCLAW_DIGEST_LIVE_MODE = "pigeon";

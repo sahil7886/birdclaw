@@ -1,3 +1,5 @@
+import type { z } from "zod";
+import type * as contracts from "./api-contracts";
 import { existsSync } from "node:fs";
 import { Effect } from "effect";
 import { maybeAutoSyncBackupEffect } from "./backup";
@@ -16,42 +18,17 @@ import { syncHomeTimelineEffect } from "./timeline-live";
 import type { WebSyncKind } from "./api-enums";
 export type { WebSyncKind } from "./api-enums";
 
-export interface WebSyncStep {
-	kind: WebSyncKind | "mention-threads";
-	label: string;
-	count: number;
-	source?: string;
-	partial?: boolean;
-	warnings?: string[];
-}
+export type WebSyncStep = z.infer<typeof contracts.webSyncStepSchema>;
 
-export interface WebSyncResponse {
-	ok: boolean;
-	kind: WebSyncKind;
-	accountId?: string;
-	startedAt: string;
-	finishedAt?: string;
-	summary: string;
-	steps: WebSyncStep[];
-	inProgress?: boolean;
-	backup?: Effect.Effect.Success<ReturnType<typeof maybeAutoSyncBackupEffect>>;
-	error?: string;
-}
+export type WebSyncResponse = z.infer<typeof contracts.webSyncResponseSchema>;
+
+export type WebSyncBackup = Effect.Effect.Success<
+	ReturnType<typeof maybeAutoSyncBackupEffect>
+>;
 
 export type WebSyncJobStatus = "running" | "succeeded" | "failed";
 
-export interface WebSyncJobSnapshot {
-	id: string;
-	kind: WebSyncKind;
-	accountId?: string;
-	status: WebSyncJobStatus;
-	startedAt: string;
-	finishedAt?: string;
-	summary: string;
-	inProgress: boolean;
-	result?: WebSyncResponse;
-	error?: string;
-}
+export type WebSyncJobSnapshot = z.infer<typeof contracts.webSyncJobSchema>;
 
 export type WebSyncDmInbox = "all" | "accepted" | "requests";
 
@@ -64,7 +41,6 @@ export interface WebSyncOptions {
 
 interface WebSyncPlan {
 	label: string;
-	accountAware: boolean;
 	run: (
 		accountId: string | undefined,
 		options: WebSyncOptions,
@@ -131,7 +107,6 @@ function summarizeSteps(steps: WebSyncStep[]) {
 const WEB_SYNC_PLANS: Record<WebSyncKind, WebSyncPlan> = {
 	timeline: {
 		label: "Home timeline",
-		accountAware: true,
 		run: (account, _options, runtime) =>
 			Effect.gen(function* () {
 				const result = yield* syncHomeTimelineEffect({
@@ -157,10 +132,10 @@ const WEB_SYNC_PLANS: Record<WebSyncKind, WebSyncPlan> = {
 	},
 	mentions: {
 		label: "Mentions",
-		accountAware: true,
 		run: (account) =>
 			Effect.gen(function* () {
 				const mentions = yield* syncMentionsEffect({
+					intent: "latest",
 					account,
 					mode: "auto",
 					limit: 100,
@@ -200,19 +175,16 @@ const WEB_SYNC_PLANS: Record<WebSyncKind, WebSyncPlan> = {
 	},
 	likes: {
 		label: "Likes",
-		accountAware: true,
 		run: (account, _options, runtime) =>
 			syncSavedCollection("likes", account, runtime),
 	},
 	bookmarks: {
 		label: "Bookmarks",
-		accountAware: true,
 		run: (account, _options, runtime) =>
 			syncSavedCollection("bookmarks", account, runtime),
 	},
 	dms: {
 		label: "Direct messages",
-		accountAware: false,
 		run: (account, options) =>
 			Effect.gen(function* () {
 				const inbox = options.inbox ?? "all";
@@ -342,18 +314,8 @@ function getRunningSyncKey(
 	options: WebSyncOptions = {},
 	runtime: ServerRuntimeServices = defaultServerRuntimeServices,
 ) {
-	if (!WEB_SYNC_PLANS[kind].accountAware) {
-		const optionKey = serializeSyncOptions(kind, options);
-		return optionKey ? `${kind}:${optionKey}` : kind;
-	}
-	return `${kind}:${accountId ?? resolveDefaultSyncAccountId(runtime)}`;
-}
-
-function getEffectiveAccountId(
-	kind: WebSyncKind,
-	accountId: string | undefined,
-) {
-	return WEB_SYNC_PLANS[kind].accountAware ? accountId : undefined;
+	const optionKey = serializeSyncOptions(kind, options);
+	return `${kind}:${accountId ?? resolveDefaultSyncAccountId(runtime)}${optionKey ? `:${optionKey}` : ""}`;
 }
 
 function setJobSnapshot(snapshot: WebSyncJobSnapshot) {
@@ -407,7 +369,7 @@ export function startWebSync(
 	options: WebSyncOptions = {},
 	runtime: ServerRuntimeServices = defaultServerRuntimeServices,
 ): WebSyncJobSnapshot {
-	const effectiveAccountId = getEffectiveAccountId(kind, accountId);
+	const effectiveAccountId = accountId;
 	const syncKey = getRunningSyncKey(kind, effectiveAccountId, options, runtime);
 	const current = runningSyncs.get(syncKey);
 	if (current) {
@@ -475,7 +437,7 @@ export function runWebSyncEffect(
 	runtime: ServerRuntimeServices = defaultServerRuntimeServices,
 ): Effect.Effect<WebSyncResponse, Error> {
 	return Effect.gen(function* () {
-		const effectiveAccountId = getEffectiveAccountId(kind, accountId);
+		const effectiveAccountId = accountId;
 		const current = runningSyncs.get(
 			getRunningSyncKey(kind, effectiveAccountId, options, runtime),
 		);

@@ -131,7 +131,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version-file: .node-version
+          node-version: "26.5.1" # Keep installed-package proof at the public runtime floor.
 
       - name: Install dependencies from Bun lockfile
         run: ./scripts/bun-canary.sh install --frozen-lockfile
@@ -177,6 +177,9 @@ jobs:
 
       - name: End-to-end tests
         run: ./scripts/bun-canary.sh run --bun e2e
+
+      - name: Read-only permalink tests
+        run: BIRDCLAW_DEPLOYMENT_READ_ONLY=1 ./scripts/bun-canary.sh ./node_modules/@playwright/test/cli.js test playwright/permalinks.spec.ts
 
       - name: Upload Playwright artifacts
         if: always()
