@@ -14,7 +14,9 @@ test("touch dismisses threads while mouse, keyboard, and links retain their beha
 }) => {
 	await page.goto("/");
 	const cards = page.locator('[data-perf="timeline-card"]');
-	const first = cards.first();
+	const first = cards.filter({
+		has: page.locator('footer a[href="/tweets/tweet_001"]'),
+	});
 	const text = first.getByText(/^We need more software/).first();
 	const conversation = page.getByRole("region", {
 		name: "Conversation",
